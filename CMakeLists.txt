@@ -13,6 +13,15 @@ find_package(CUDAToolkit REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(Open3D REQUIRED HINTS /home/hydran00/Open3D/lib/cmake/Open3D)
+include(FetchContent)
+
+FetchContent_Declare(
+  yaml-cpp
+  GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+  GIT_TAG yaml-cpp-0.9.0 # Can be a tag (yaml-cpp-x.x.x), a commit hash, or a branch name (master)
+)
+FetchContent_MakeAvailable(yaml-cpp)
+
 
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
@@ -30,6 +39,7 @@ target_link_libraries(dfusion
     Eigen3::Eigen
     CUDA::cudart
     CUDA::cublas
+    yaml-cpp::yaml-cpp
 )
 
 # Main executable

@@ -130,11 +130,11 @@ __global__ void raycast_kernel(
     float            truncation,
     float3*          out_vertices,
     float3*          out_normals,
+    int*             out_canonical_vidx,  // canonical voxel index per pixel (may be null)
     int              img_w,
     int              img_h,
     CameraIntrinsics cam,
-    Mat4             T_world_cam,    // camera → world
-    // Warp field opzionale
+    Mat4             T_world_cam,
     const DeformNode* nodes,
     const Mat4*       transforms,
     int               num_nodes,
@@ -150,6 +150,7 @@ __global__ void raycast_kernel(
     int px_idx = v * img_w + u;
     out_vertices[px_idx] = make_float3(0,0,0);
     out_normals [px_idx] = make_float3(0,0,0);
+    if (out_canonical_vidx) out_canonical_vidx[px_idx] = -1;
 
     // Raggio in world space
     float3 ray_d_cam   = cam.unproject(u, v, 1.f);
@@ -212,7 +213,18 @@ __global__ void raycast_kernel(
             grad.z = sample(0,0,1) - sample(0,0,-1);
             float3 normal = normalize3(grad);
 
-            out_vertices[px_idx] = p_surface;
+            // Output canonical voxel index for pixel_knn lookup
+            if (out_canonical_vidx) out_canonical_vidx[px_idx] = vidx;
+
+            // Apply warp to get live-space vertex
+            float3 p_live = p_surface;
+            if (use_warp && num_nodes > 0) {
+                const int*   knn   = voxel_knn   + vidx * K_NEIGHBORS;
+                const float* knn_w = voxel_knn_w + vidx * K_NEIGHBORS;
+                p_live = warp_point(p_surface, nodes, transforms, knn, knn_w);
+            }
+
+            out_vertices[px_idx] = p_live;
             out_normals [px_idx] = normal;
             found_zero_crossing  = true;
             break;
@@ -325,4 +337,78 @@ __global__ void find_correspondences_kernel(
 
 store:
     corrs[px] = corr;
+}
+
+// ─────────────────────────────────────────────
+//  Kernel: voxel_knn → pixel_knn
+//  For each live pixel, look up the voxel that
+//  contains the live vertex and copy its k-NN.
+//  Approximation: canonical pos ≈ live pos
+//  (valid for small deformations).
+// ─────────────────────────────────────────────
+
+__global__ void compute_pixel_knn_kernel(
+    const int*    canonical_vidx,  // from raycast: canonical voxel hit per pixel
+    int           img_w,
+    int           img_h,
+    const int*    voxel_knn,
+    const float*  voxel_knn_w,
+    int*          pixel_knn,
+    float*        pixel_knn_w)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= img_w || v >= img_h) return;
+
+    int px = v * img_w + u;
+
+    for (int k = 0; k < K_NEIGHBORS; k++) {
+        pixel_knn  [px * K_NEIGHBORS + k] = -1;
+        pixel_knn_w[px * K_NEIGHBORS + k] = 0.f;
+    }
+
+    int vidx = canonical_vidx[px];
+    if (vidx < 0) return;
+
+    for (int k = 0; k < K_NEIGHBORS; k++) {
+        pixel_knn  [px * K_NEIGHBORS + k] = voxel_knn  [vidx * K_NEIGHBORS + k];
+        pixel_knn_w[px * K_NEIGHBORS + k] = voxel_knn_w[vidx * K_NEIGHBORS + k];
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Bounding box filter
+// ─────────────────────────────────────────────
+
+__global__ void bbox_filter_kernel(float3* vertices, int n, float3 min_pt, float3 max_pt)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float3 v = vertices[i];
+    if (v.x < min_pt.x || v.x > max_pt.x ||
+        v.y < min_pt.y || v.y > max_pt.y ||
+        v.z < min_pt.z || v.z > max_pt.z)
+        vertices[i] = make_float3(0.f, 0.f, 0.f);
+}
+
+__global__ void depth_bbox_filter_kernel(
+    float*           depth,
+    int              w,
+    int              h,
+    CameraIntrinsics cam,
+    float3           min_pt,
+    float3           max_pt)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= w || v >= h) return;
+
+    float d = depth[v * w + u];
+    if (d <= 0.f) return;
+
+    float3 p = cam.unproject((float)u, (float)v, d);
+    if (p.x < min_pt.x || p.x > max_pt.x ||
+        p.y < min_pt.y || p.y > max_pt.y ||
+        p.z < min_pt.z || p.z > max_pt.z)
+        depth[v * w + u] = 0.f;
 }

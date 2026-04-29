@@ -40,12 +40,12 @@ public:
         DeviceArray<float3> &normals,
         const CameraIntrinsics &cam,
         const Mat4 &camera_pose,
-        // Warp field opzionale
         const DeformNode *nodes = nullptr,
         const Mat4 *transforms = nullptr,
         int num_nodes = 0,
         const int *voxel_knn = nullptr,
-        const float *voxel_knn_w = nullptr);
+        const float *voxel_knn_w = nullptr,
+        int *out_canonical_vidx = nullptr);
 
     // Estrai mesh (marching cubes semplificato — output su CPU)
     void extract_surface(

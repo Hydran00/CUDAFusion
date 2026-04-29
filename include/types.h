@@ -198,6 +198,16 @@ struct BSRMatrix {
 };
 
 // ─────────────────────────────────────────────
+//  Bounding box filter
+// ─────────────────────────────────────────────
+
+struct BBoxFilter {
+    float3 min_pt;
+    float3 max_pt;
+    bool   enabled = false;
+};
+
+// ─────────────────────────────────────────────
 //  Helper: CUDA error check
 // ─────────────────────────────────────────────
 

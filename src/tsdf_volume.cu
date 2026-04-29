@@ -62,7 +62,8 @@ void TSDFVolume::raycast(DeviceArray<float3>& vertices,
                          const CameraIntrinsics& cam, const Mat4& camera_pose,
                          const DeformNode* nodes, const Mat4* transforms,
                          int num_nodes, const int* voxel_knn,
-                         const float* voxel_knn_w) {
+                         const float* voxel_knn_w,
+                         int* out_canonical_vidx) {
   int n_pixels = cam.width * cam.height;
   vertices.allocate(n_pixels);
   normals.allocate(n_pixels);
@@ -75,9 +76,9 @@ void TSDFVolume::raycast(DeviceArray<float3>& vertices,
 
   raycast_kernel<<<grid, block>>>(
       d_voxels_.data, params_.dims, params_.origin, params_.voxel_size,
-      params_.truncation, vertices.data, normals.data, cam.width, cam.height,
-      cam, camera_pose, nodes, transforms, num_nodes, voxel_knn, voxel_knn_w,
-      use_warp);
+      params_.truncation, vertices.data, normals.data, out_canonical_vidx,
+      cam.width, cam.height, cam, camera_pose, nodes, transforms, num_nodes,
+      voxel_knn, voxel_knn_w, use_warp);
 
   cudaDeviceSynchronize();
 }
@@ -255,13 +256,13 @@ void TSDFVolume::extract_surface(std::vector<float3>& out_vertices,
   for (int ix = 0; ix < W-1; ix++) {
     // get 8 corner TSDF values
     float cv[8];
-    bool any_observed = false;
+    bool all_observed = true;
     for (int c = 0; c < 8; c++) {
       int cx = ix+co[c][0], cy = iy+co[c][1], cz = iz+co[c][2];
-      if (weight_at(cx,cy,cz) > 0) any_observed = true;
+      if (weight_at(cx,cy,cz) <= 0) { all_observed = false; break; }
       cv[c] = tsdf_at(cx, cy, cz);
     }
-    if (!any_observed) continue;
+    if (!all_observed) continue;
 
     // build cube index (bit set = tsdf > 0, i.e. outside)
     int cube_idx = 0;

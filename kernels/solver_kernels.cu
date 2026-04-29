@@ -79,6 +79,30 @@ __global__ void assemble_data_term_kernel(
     }
 }
 
+__device__ void compute_arap_jacobian(
+    const float3& p,   // p = T * x
+    float J[6][3])     // 6 parametri × 3 output (trasposta rispetto forma classica)
+{
+    // Rotazione (parte skew-symmetric)
+    J[0][0] = 0.0f;     J[0][1] =  p.z;    J[0][2] = -p.y;
+    J[1][0] = -p.z;     J[1][1] = 0.0f;    J[1][2] =  p.x;
+    J[2][0] =  p.y;     J[2][1] = -p.x;    J[2][2] = 0.0f;
+
+    // Traslazione (identità)
+    J[3][0] = 1.0f;     J[3][1] = 0.0f;    J[3][2] = 0.0f;
+    J[4][0] = 0.0f;     J[4][1] = 1.0f;    J[4][2] = 0.0f;
+    J[5][0] = 0.0f;     J[5][1] = 0.0f;    J[5][2] = 1.0f;
+}
+
+__device__ int find_block(
+    int row, int col,
+    const int* row_ptr,
+    const int* col_idx)
+{
+    for (int r = row_ptr[row]; r < row_ptr[row+1]; r++)
+        if (col_idx[r] == col) return r;
+    return -1;
+}
 // ─────────────────────────────────────────────
 //  Kernel: termine smoothness ARAP
 //  Per ogni arco (i,j) del grafo:
@@ -89,7 +113,7 @@ __global__ void assemble_smooth_term_kernel(
     const DeformNode* nodes,
     const Mat4*       transforms,
     int               num_nodes,
-    float             lambda_smooth,
+    float             lambda,
     float*            A_values,
     float*            b_values,
     const int*        row_ptr,
@@ -106,51 +130,78 @@ __global__ void assemble_smooth_term_kernel(
 
         float3 xj = nodes[nj].pos;
 
-        // Residuo smoothness: T_i * x_j - T_j * x_j
         float3 Ti_xj = transforms[ni].transform_point(xj);
         float3 Tj_xj = transforms[nj].transform_point(xj);
 
-        float3 res = make_float3(Ti_xj.x - Tj_xj.x,
-                                  Ti_xj.y - Tj_xj.y,
-                                  Ti_xj.z - Tj_xj.z);
+        float3 r = make_float3(
+            Ti_xj.x - Tj_xj.x,
+            Ti_xj.y - Tj_xj.y,
+            Ti_xj.z - Tj_xj.z);
 
-        // Jacobiana rispetto a twist di nodo i: ∂(T_i * xj) / ∂ξ_i
-        // = [-(T_i * xj)×  |  I] per parametrizzazione a sinistra
-        float3 Tixj = Ti_xj;
-        float Ji[6][3];  // 6 parametri twist, 3 output
-        Ji[0][0] = 0;       Ji[0][1] =  Tixj.z; Ji[0][2] = -Tixj.y;
-        Ji[1][0] = -Tixj.z; Ji[1][1] = 0;       Ji[1][2] =  Tixj.x;
-        Ji[2][0] =  Tixj.y; Ji[2][1] = -Tixj.x; Ji[2][2] = 0;
-        Ji[3][0] = 1;       Ji[3][1] = 0;        Ji[3][2] = 0;
-        Ji[4][0] = 0;       Ji[4][1] = 1;        Ji[4][2] = 0;
-        Ji[5][0] = 0;       Ji[5][1] = 0;        Ji[5][2] = 1;
+        float Ji[6][3], Jj[6][3];
 
-        // Contributo diagonale A(ni,ni) += λ * Ji^T Ji
-        int diag_pos = -1;
-        for (int r = row_ptr[ni]; r < row_ptr[ni+1]; r++)
-            if (col_idx[r] == ni) { diag_pos = r; break; }
+        compute_arap_jacobian(Ti_xj, Ji);
+        compute_arap_jacobian(Tj_xj, Jj);
 
-        if (diag_pos >= 0) {
-            float* blk = A_values + diag_pos * BLOCK_SIZE;
-            for (int a = 0; a < 6; a++)
-                for (int b = 0; b < 6; b++) {
-                    float JtJ = 0;
-                    for (int c = 0; c < 3; c++)
-                        JtJ += Ji[a][c] * Ji[b][c];
-                    atomicAdd(&blk[a*6+b], lambda_smooth * JtJ);
+        if (nj <= ni) continue; 
+
+        int ii = find_block(ni, ni, row_ptr, col_idx);
+        int jj = find_block(nj, nj, row_ptr, col_idx);
+        int ij = find_block(ni, nj, row_ptr, col_idx);
+        int ji = find_block(nj, ni, row_ptr, col_idx);
+
+        // --- A(ii) ---
+        if (ii >= 0)
+            for (int a=0;a<6;a++)
+                for (int b=0;b<6;b++) {
+                    float v = 0;
+                    for (int c=0;c<3;c++)
+                        v += Ji[a][c]*Ji[b][c];
+                    atomicAdd(&A_values[ii*36 + a*6+b], lambda * v);
                 }
-        }
 
-        // Contributo RHS b(ni) -= λ * Ji^T * res
-        for (int a = 0; a < 6; a++) {
-            float Jt_r = 0;
-            const float res_arr[3] = {res.x, res.y, res.z};
-            for (int c = 0; c < 3; c++)
-                Jt_r += Ji[a][c] * res_arr[c];
-            atomicAdd(&b_values[ni*6+a], -lambda_smooth * Jt_r);
+        // --- A(jj) ---
+        if (jj >= 0)
+            for (int a=0;a<6;a++)
+                for (int b=0;b<6;b++) {
+                    float v = 0;
+                    for (int c=0;c<3;c++)
+                        v += Jj[a][c]*Jj[b][c];
+                    atomicAdd(&A_values[jj*36 + a*6+b], lambda * v);
+                }
+
+        // --- A(ij) ---
+        if (ij >= 0)
+            for (int a=0;a<6;a++)
+                for (int b=0;b<6;b++) {
+                    float v = 0;
+                    for (int c=0;c<3;c++)
+                        v += Ji[a][c]*Jj[b][c];
+                    atomicAdd(&A_values[ij*36 + a*6+b], -lambda * v);
+                }
+
+        // --- A(ji) ---
+        if (ji >= 0)
+            for (int a=0;a<6;a++)
+                for (int b=0;b<6;b++) {
+                    float v = 0;
+                    for (int c=0;c<3;c++)
+                        v += Jj[a][c]*Ji[b][c];
+                    atomicAdd(&A_values[ji*36 + a*6+b], -lambda * v);
+                }
+
+        // --- RHS ---
+        float r_arr[3] = {r.x, r.y, r.z};
+
+        for (int a=0;a<6;a++) {
+            float vi = 0, vj = 0;
+            for (int c=0;c<3;c++) {
+                vi += Ji[a][c]*r_arr[c];
+                vj += Jj[a][c]*r_arr[c];
+            }
+            atomicAdd(&b_values[ni*6+a], -lambda * vi);
+            atomicAdd(&b_values[nj*6+a],  lambda * vj);
         }
-        // Note: termini off-diagonale con nj omessi per semplicità
-        // (approssimazione comune in implementazioni real-time)
     }
 }
 
@@ -209,30 +260,24 @@ __global__ void bsr_spmv_kernel(
     float*       y,
     int          num_nodes)
 {
-    int ni = blockIdx.x;
-    if (ni >= num_nodes) return;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= num_nodes * 6) return;
 
-    // Shared memory per accumulatore
-    __shared__ float acc[BLOCK_DIM];
+    int ni  = gid / 6;
+    int row = gid % 6;
 
-    int lane = threadIdx.x;  // 0..5 per le 6 righe del blocco
-    if (lane >= BLOCK_DIM) return;
+    float sum = 0.0f;
 
-    float sum = 0;
-
-    // Itera su tutti i blocchi della riga ni
     for (int b = row_ptr[ni]; b < row_ptr[ni+1]; b++) {
-        int   nj  = col_idx[b];
-        const float* blk = A_values + b * BLOCK_SIZE;
-        const float* xj  = x + nj * BLOCK_DIM;
+        int nj = col_idx[b];
+        const float* blk = A_values + b * 36;
+        const float* xj  = x + nj * 6;
 
-        // Prodotto blocco-vettore: riga 'lane' del blocco * xj
-        #pragma unroll
-        for (int c = 0; c < BLOCK_DIM; c++)
-            sum += blk[lane * BLOCK_DIM + c] * xj[c];
+        for (int c = 0; c < 6; c++)
+            sum += blk[row*6 + c] * xj[c];
     }
 
-    y[ni * BLOCK_DIM + lane] = sum;
+    y[gid] = sum;
 }
 
 // ─────────────────────────────────────────────

@@ -15,7 +15,7 @@
 #include "solver.h"
 
 #include <open3d/Open3D.h>
-
+#include "yaml_helper.h"
 namespace fs = std::filesystem;
 
 // ─────────────────────────────────────────────
@@ -151,7 +151,7 @@ private:
             std::cerr << "[DepthSequence] Directory not found: " << dir << "\n";
             return;
         }
-
+        // std::cout << "[DepthSequence] file: " << p << std::endl;
         std::vector<std::string> paths;
         for (const auto &entry : fs::directory_iterator(dir))
         {
@@ -208,6 +208,113 @@ private:
 };
 
 // ─────────────────────────────────────────────
+//  Debug visualization helpers
+// ─────────────────────────────────────────────
+
+static cv::Mat dbg_depth(const std::vector<float> &d, int W, int H, float max_m = 4.0f)
+{
+    cv::Mat grey(H, W, CV_8U);
+    for (int i = 0; i < H * W; i++) {
+        float v = d[i];
+        grey.data[i] = (v > 0.01f && v < max_m) ? (uint8_t)(v / max_m * 255.f) : 0;
+    }
+    cv::Mat color;
+    cv::applyColorMap(grey, color, cv::COLORMAP_JET);
+    for (int i = 0; i < H * W; i++)
+        if (d[i] <= 0.01f || d[i] >= max_m)
+            color.data[i * 3] = color.data[i * 3 + 1] = color.data[i * 3 + 2] = 0;
+    return color;
+}
+
+static cv::Mat dbg_normals(const std::vector<float3> &n, int W, int H)
+{
+    cv::Mat img(H, W, CV_8UC3);
+    for (int i = 0; i < H * W; i++) {
+        float len = sqrtf(n[i].x * n[i].x + n[i].y * n[i].y + n[i].z * n[i].z);
+        if (len < 0.5f) {
+            img.data[i * 3] = img.data[i * 3 + 1] = img.data[i * 3 + 2] = 0;
+        } else {
+            img.data[i * 3 + 0] = (uint8_t)((n[i].z * 0.5f + 0.5f) * 255); // B=z
+            img.data[i * 3 + 1] = (uint8_t)((n[i].y * 0.5f + 0.5f) * 255); // G=y
+            img.data[i * 3 + 2] = (uint8_t)((n[i].x * 0.5f + 0.5f) * 255); // R=x
+        }
+    }
+    return img;
+}
+
+static cv::Mat dbg_verts(const std::vector<float3> &verts, const CameraIntrinsics &cam)
+{
+    cv::Mat depth(cam.height, cam.width, CV_32F, cv::Scalar(0.f));
+    for (const auto &v : verts) {
+        if (v.z <= 0.01f) continue;
+        int u  = (int)(cam.fx * v.x / v.z + cam.cx);
+        int vv = (int)(cam.fy * v.y / v.z + cam.cy);
+        if (u >= 0 && u < cam.width && vv >= 0 && vv < cam.height)
+            depth.at<float>(vv, u) = v.z;
+    }
+    cv::Mat grey, color;
+    cv::normalize(depth, grey, 0, 255, cv::NORM_MINMAX, CV_8U);
+    cv::applyColorMap(grey, color, cv::COLORMAP_TURBO);
+    for (int r = 0; r < cam.height; r++)
+        for (int c = 0; c < cam.width; c++)
+            if (depth.at<float>(r, c) <= 0.01f)
+                color.at<cv::Vec3b>(r, c) = {0, 0, 0};
+    cv::putText(color, "live surface (raycasted)", {8, 18},
+                cv::FONT_HERSHEY_SIMPLEX, 0.45, {220, 220, 220}, 1);
+    return color;
+}
+
+static cv::Mat dbg_corrs(const std::vector<Correspondence> &corrs,
+                         const CameraIntrinsics &cam, int n_valid)
+{
+    cv::Mat img(cam.height, cam.width, CV_8UC3, cv::Scalar(15, 15, 15));
+    int drawn = 0;
+    for (const auto &c : corrs) {
+        if (!c.valid) continue;
+        if (c.dst.z > 0.01f) {
+            int u = (int)(cam.fx * c.dst.x / c.dst.z + cam.cx);
+            int v = (int)(cam.fy * c.dst.y / c.dst.z + cam.cy);
+            if (u >= 0 && u < cam.width && v >= 0 && v < cam.height)
+                cv::circle(img, {u, v}, 1, {0, 0, 200}, -1);
+        }
+        if (c.src.z > 0.01f) {
+            int u = (int)(cam.fx * c.src.x / c.src.z + cam.cx);
+            int v = (int)(cam.fy * c.src.y / c.src.z + cam.cy);
+            if (u >= 0 && u < cam.width && v >= 0 && v < cam.height)
+                cv::circle(img, {u, v}, 1, {0, 200, 0}, -1);
+        }
+        if (++drawn >= 10000) break;
+    }
+    cv::putText(img, "G=live  R=depth  valid=" + std::to_string(n_valid),
+                {8, 18}, cv::FONT_HERSHEY_SIMPLEX, 0.45, {220, 220, 220}, 1);
+    return img;
+}
+
+static cv::Mat dbg_delta_x(const std::vector<float> &dx, int n_nodes)
+{
+    const int bar_w = 4, bar_h = 200, pad = 2;
+    int img_w = std::max(300, (bar_w + pad) * n_nodes + pad);
+    cv::Mat img(bar_h + 20, img_w, CV_8UC3, cv::Scalar(20, 20, 20));
+    float max_norm = 0.f;
+    std::vector<float> norms(n_nodes, 0.f);
+    for (int i = 0; i < n_nodes; i++) {
+        for (int j = 0; j < 6; j++) norms[i] += dx[i * 6 + j] * dx[i * 6 + j];
+        norms[i] = sqrtf(norms[i]);
+        max_norm = std::max(max_norm, norms[i]);
+    }
+    if (max_norm < 1e-8f) max_norm = 1.f;
+    int max_bars = (img_w - pad) / (bar_w + pad);
+    for (int i = 0; i < n_nodes && i < max_bars; i++) {
+        int h  = (int)(norms[i] / max_norm * bar_h);
+        int x0 = pad + i * (bar_w + pad);
+        cv::rectangle(img, {x0, bar_h - h}, {x0 + bar_w, bar_h}, {0, 200, 200}, -1);
+    }
+    cv::putText(img, "delta_x norm/node  max=" + std::to_string(max_norm),
+                {4, bar_h + 14}, cv::FONT_HERSHEY_SIMPLEX, 0.4, {200, 200, 200}, 1);
+    return img;
+}
+
+// ─────────────────────────────────────────────
 //  Pipeline DynamicFusion (self-contained per test)
 // ─────────────────────────────────────────────
 
@@ -219,12 +326,15 @@ public:
         TSDFVolume::Params tsdf;
         GaussNewtonSolver::Params solver;
         CameraIntrinsics cam;
-        float node_radius = 0.05f;
+        float node_radius = 0.04f;
         float node_min_dist = 0.025f;
         float dist_threshold = 0.05f; // ICP distanza max
         float angle_threshold = 0.7f; // cos(angolo) min normali
         int max_nodes = 4096;
         int max_corrs = 300000;
+        BBoxFilter bbox;
+        bool debug_vis = false;
+        int  debug_every_n = 1;
     };
 
     explicit DynamicFusionPipeline(const Params &p)
@@ -239,8 +349,10 @@ public:
         d_depth_normals_.allocate(n_pixels);
         d_vertices_live_.allocate(n_pixels);
         d_normals_live_.allocate(n_pixels);
-        d_corrs_.allocate(p.max_corrs);
+        d_corrs_.allocate(n_pixels);
         d_delta_x_.allocate(p.max_nodes * 6);
+        d_hit_voxel_idx_.allocate(n_pixels);
+        d_num_valid_.allocate(1);
 
         camera_pose_ = Mat4::identity();
     }
@@ -248,6 +360,8 @@ public:
     void process_frame(const cv::Mat &depth_m)
     {
         auto t0 = std::chrono::high_resolution_clock::now();
+
+        const bool do_dbg = params_.debug_vis && (frame_count_ % params_.debug_every_n == 0);
 
         // 1. Upload depth
         {
@@ -257,8 +371,33 @@ public:
             d_depth_.upload(h_depth);
         }
 
+        if (do_dbg)
+        {
+            std::vector<float> h_d;
+            d_depth_.download(h_d);
+            cv::Mat vis = dbg_depth(h_d, params_.cam.width, params_.cam.height);
+            cv::putText(vis, "frame " + std::to_string(frame_count_),
+                        {8, 18}, cv::FONT_HERSHEY_SIMPLEX, 0.45, {220, 220, 220}, 1);
+            cv::imshow("1_depth_raw", vis);
+            cv::waitKey(1);
+        }
+
+        // 1b. Bounding box filter on depth (before integration)
+        if (params_.bbox.enabled)
+        {
+            apply_depth_bbox_filter();
+        }
+
         // 2. Calcola normali dal depth
         compute_normals();
+
+        if (do_dbg)
+        {
+            std::vector<float3> h_n;
+            d_depth_normals_.download(h_n);
+            cv::imshow("2_depth_normals", dbg_normals(h_n, params_.cam.width, params_.cam.height));
+            cv::waitKey(1);
+        }
 
         if (frame_count_ == 0)
         {
@@ -279,17 +418,40 @@ public:
                 warp_field_->device_nodes(),
                 warp_field_->device_transforms(),
                 warp_field_->num_nodes(),
-                d_voxel_knn_.data, d_voxel_knn_w_.data);
+                d_voxel_knn_.data, d_voxel_knn_w_.data,
+                d_hit_voxel_idx_.data);
+
+            if (do_dbg)
+            {
+                std::vector<float3> h_v;
+                d_vertices_live_.download(h_v);
+                cv::imshow("3_live_surface", dbg_verts(h_v, params_.cam));
+                cv::waitKey(1);
+            }
+
+            // 3b. Bounding box filter on live vertices
+            if (params_.bbox.enabled)
+                apply_bbox_filter(d_vertices_live_);
 
             // 4. Trova corrispondenze ICP
             int num_corrs = find_correspondences();
             std::cout << "  Corrispondenze valide: " << num_corrs << "\n";
 
+            if (do_dbg)
+            {
+                std::vector<Correspondence> h_c;
+                d_corrs_.download(h_c);
+                cv::imshow("4_correspondences", dbg_corrs(h_c, params_.cam, num_corrs));
+                cv::waitKey(1);
+            }
+
             if (num_corrs > 100)
             {
                 // 5. Ottimizzazione Gauss-Newton
+                // Pass full pixel array size; solver skips invalid entries via corr.valid
+                int n_pixels = params_.cam.width * params_.cam.height;
                 solver_->solve(
-                    d_corrs_, num_corrs,
+                    d_corrs_, n_pixels,
                     warp_field_->device_nodes(),
                     warp_field_->device_transforms(),
                     warp_field_->num_nodes(),
@@ -297,6 +459,21 @@ public:
 
                 // 6. Applica incremento
                 warp_field_->apply_twist_increment(d_delta_x_);
+                {
+                    std::vector<float> h_dx;
+                    d_delta_x_.download(h_dx);
+                    float norm2 = 0;
+                    int n6 = warp_field_->num_nodes() * 6;
+                    for (int i = 0; i < n6; i++)
+                        norm2 += h_dx[i] * h_dx[i];
+                    std::cout << "  [dx] ||delta_x||=" << sqrtf(norm2)
+                              << " nodes=" << warp_field_->num_nodes() << "\n";
+                    if (do_dbg)
+                    {
+                        cv::imshow("5_delta_x", dbg_delta_x(h_dx, warp_field_->num_nodes()));
+                        cv::waitKey(1);
+                    }
+                }
             }
 
             // 7. Integra depth con warp corrente
@@ -341,7 +518,97 @@ public:
         for (auto &t : tris)
             mesh.triangles_.push_back({t.x, t.y, t.z});
         mesh.ComputeVertexNormals();
-        mesh.PaintUniformColor({1.0, 1.0, 0.0});
+        mesh.PaintUniformColor({1.0, 1.0, 1.0});
+    }
+
+    // Salva la mesh warped (live frame) come PLY
+    // CPU skinning: per ogni vertice canonico, applica blend delle trasformazioni nodi più vicini
+    void save_warped_mesh_ply(const std::string &path) const
+    {
+        std::vector<float3> verts, norms;
+        std::vector<int3> tris;
+        volume_->extract_surface(verts, norms, tris);
+
+        int num_nodes = warp_field_->num_nodes();
+        if (num_nodes == 0)
+        {
+            save_mesh_ply(path);
+            return;
+        }
+
+        auto h_nodes = warp_field_->download_nodes();
+        auto h_transforms = warp_field_->download_transforms();
+
+        std::vector<float3> warped(verts.size());
+        for (size_t vi = 0; vi < verts.size(); vi++)
+        {
+            float3 p = verts[vi];
+
+            // Brute-force K-NN among nodes
+            float best_d2[K_NEIGHBORS];
+            int best_id[K_NEIGHBORS];
+            for (int k = 0; k < K_NEIGHBORS; k++)
+            {
+                best_d2[k] = 1e30f;
+                best_id[k] = -1;
+            }
+            for (int ni = 0; ni < num_nodes; ni++)
+            {
+                float3 d = {p.x - h_nodes[ni].pos.x, p.y - h_nodes[ni].pos.y, p.z - h_nodes[ni].pos.z};
+                float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+                if (d2 < best_d2[K_NEIGHBORS - 1])
+                {
+                    best_d2[K_NEIGHBORS - 1] = d2;
+                    best_id[K_NEIGHBORS - 1] = ni;
+                    for (int k = K_NEIGHBORS - 2; k >= 0; k--)
+                    {
+                        if (best_d2[k + 1] < best_d2[k])
+                        {
+                            std::swap(best_d2[k], best_d2[k + 1]);
+                            std::swap(best_id[k], best_id[k + 1]);
+                        }
+                    }
+                }
+            }
+
+            float w_sum = 0;
+            float weights[K_NEIGHBORS] = {};
+            for (int k = 0; k < K_NEIGHBORS; k++)
+            {
+                if (best_id[k] < 0)
+                    continue;
+                float r = h_nodes[best_id[k]].radius;
+                weights[k] = expf(-best_d2[k] / (2.f * r * r));
+                w_sum += weights[k];
+            }
+
+            float3 wp = {0, 0, 0};
+            for (int k = 0; k < K_NEIGHBORS; k++)
+            {
+                if (best_id[k] < 0 || w_sum < 1e-8f)
+                    continue;
+                float w = weights[k] / w_sum;
+                float3 tp = h_transforms[best_id[k]].transform_point(p);
+                wp.x += w * tp.x;
+                wp.y += w * tp.y;
+                wp.z += w * tp.z;
+            }
+            warped[vi] = (w_sum > 1e-8f) ? wp : p;
+        }
+
+        std::ofstream f(path);
+        f << "ply\nformat ascii 1.0\n";
+        f << "element vertex " << warped.size() << "\n";
+        f << "property float x\nproperty float y\nproperty float z\n";
+        f << "property float nx\nproperty float ny\nproperty float nz\n";
+        f << "element face " << tris.size() << "\n";
+        f << "property list uchar int vertex_indices\nend_header\n";
+        for (size_t i = 0; i < warped.size(); i++)
+            f << warped[i].x << " " << warped[i].y << " " << warped[i].z << " "
+              << norms[i].x << " " << norms[i].y << " " << norms[i].z << "\n";
+        for (const auto &t : tris)
+            f << "3 " << t.x << " " << t.y << " " << t.z << "\n";
+        std::cout << "[PLY warped] " << path << " (" << warped.size() << " v)\n";
     }
 
     // Salva la mesh canonica corrente come PLY
@@ -387,6 +654,10 @@ private:
     DeviceArray<float> d_delta_x_;
     DeviceArray<int> d_voxel_knn_;
     DeviceArray<float> d_voxel_knn_w_;
+    DeviceArray<int> d_pixel_knn_;
+    DeviceArray<float> d_pixel_knn_w_;
+    DeviceArray<int> d_num_valid_;
+    DeviceArray<int> d_hit_voxel_idx_;
 
     Mat4 camera_pose_;
 
@@ -407,21 +678,52 @@ private:
     {
         std::vector<float3> verts, norms;
         std::vector<int3> tris;
+        auto t0_extract = std::chrono::high_resolution_clock::now();
         volume_->extract_surface(verts, norms, tris);
-
+        auto t1_extract = std::chrono::high_resolution_clock::now();
+        double ms_extract = std::chrono::duration<double, std::milli>(t1_extract - t0_extract).count();
+        std::cout << "  Surface extracted: " << verts.size() << " vertices in " << ms_extract << " ms\n";
+        auto t0_add = std::chrono::high_resolution_clock::now();
         int added = warp_field_->add_nodes_from_surface(verts, params_.node_min_dist);
+        auto t1_add = std::chrono::high_resolution_clock::now();
+        double ms_add = std::chrono::duration<double, std::milli>(t1_add - t0_add).count();
+        std::cout << "  Nodes initialized: " << added << " in " << ms_add << " ms\n";
+        auto t0_knn = std::chrono::high_resolution_clock::now();
         warp_field_->compute_voxel_knn(*volume_, d_voxel_knn_, d_voxel_knn_w_);
+        auto t1_knn = std::chrono::high_resolution_clock::now();
+        double ms_knn = std::chrono::duration<double, std::milli>(t1_knn - t0_knn).count();
+        std::cout << "  Voxel k-NN computed in " << ms_knn << " ms\n";
 
         std::cout << "[Init] Nodi aggiunti: " << added << "\n";
     }
 
     void update_node_graph()
     {
-        std::vector<float3> verts, norms;
-        std::vector<int3> tris;
-        volume_->extract_surface(verts, norms, tris);
+        // Download canonical voxel hit-map from raycast → convert to canonical world pos
+        // Avoids MC; gives correct canonical (not warped) positions for new nodes
+        int n_pixels = params_.cam.width * params_.cam.height;
+        std::vector<int> h_vidx(n_pixels);
+        cudaMemcpy(h_vidx.data(), d_hit_voxel_idx_.data,
+                   n_pixels * sizeof(int), cudaMemcpyDeviceToHost);
 
-        int added = warp_field_->add_nodes_from_surface(verts, params_.node_min_dist);
+        const auto &tp = params_.tsdf;
+        std::vector<float3> canonical_pts;
+        canonical_pts.reserve(n_pixels / 4);
+        for (int px = 0; px < n_pixels; px++)
+        {
+            int vidx = h_vidx[px];
+            if (vidx < 0)
+                continue;
+            int vx = vidx % tp.dims.x;
+            int vy = (vidx / tp.dims.x) % tp.dims.y;
+            int vz = vidx / (tp.dims.x * tp.dims.y);
+            canonical_pts.push_back(make_float3(
+                tp.origin.x + vx * tp.voxel_size,
+                tp.origin.y + vy * tp.voxel_size,
+                tp.origin.z + vz * tp.voxel_size));
+        }
+
+        int added = warp_field_->add_nodes_from_surface(canonical_pts, params_.node_min_dist);
         if (added > 0)
         {
             warp_field_->compute_voxel_knn(*volume_, d_voxel_knn_, d_voxel_knn_w_);
@@ -429,24 +731,149 @@ private:
         }
     }
 
+    void apply_depth_bbox_filter()
+    {
+        dim3 block(16, 16);
+        dim3 grid(
+            (params_.cam.width + block.x - 1) / block.x,
+            (params_.cam.height + block.y - 1) / block.y);
+        depth_bbox_filter_kernel<<<grid, block>>>(
+            d_depth_.data,
+            params_.cam.width, params_.cam.height,
+            params_.cam,
+            params_.bbox.min_pt, params_.bbox.max_pt);
+        cudaDeviceSynchronize();
+    }
+
+    void apply_bbox_filter(DeviceArray<float3> &verts)
+    {
+        int n = (int)verts.size();
+        bbox_filter_kernel<<<grid1d(n), 256>>>(
+            verts.data, n,
+            params_.bbox.min_pt, params_.bbox.max_pt);
+        cudaDeviceSynchronize();
+    }
+
     int find_correspondences()
     {
-        // Versione semplificata: usa un kernel custom
-        // (omesso per brevità — in produzione: find_correspondences_kernel)
-        // Restituisce numero di corrispondenze valide
-        // Per ora: placeholder che conta i pixel live validi
-        std::vector<float3> h_verts(d_vertices_live_.size());
-        cudaMemcpy(h_verts.data(), d_vertices_live_.data,
-                   d_vertices_live_.bytes(), cudaMemcpyDeviceToHost);
+        int n_pixels = params_.cam.width * params_.cam.height;
 
-        int count = 0;
-        for (const auto &v : h_verts)
-            if (v.x * v.x + v.y * v.y + v.z * v.z > 1e-6f)
-                count++;
-        return count;
+        // Ensure pixel k-NN arrays sized correctly
+        if (d_pixel_knn_.size() != (size_t)(n_pixels * K_NEIGHBORS))
+        {
+            d_pixel_knn_.allocate(n_pixels * K_NEIGHBORS);
+            d_pixel_knn_w_.allocate(n_pixels * K_NEIGHBORS);
+        }
+        d_num_valid_.zero();
+
+        dim3 block(16, 16);
+        dim3 grid(
+            (params_.cam.width + block.x - 1) / block.x,
+            (params_.cam.height + block.y - 1) / block.y);
+
+        // Step 1: map canonical voxel idx → pixel k-NN (exact, no live≈canonical approx)
+        compute_pixel_knn_kernel<<<grid, block>>>(
+            d_hit_voxel_idx_.data,
+            params_.cam.width, params_.cam.height,
+            d_voxel_knn_.data, d_voxel_knn_w_.data,
+            d_pixel_knn_.data, d_pixel_knn_w_.data);
+
+        // Step 2: projective ICP — fill d_corrs_
+        Mat4 T_cam_world = Mat4::identity(); // camera_pose_ = identity
+        find_correspondences_kernel<<<grid, block>>>(
+            d_vertices_live_.data, d_normals_live_.data,
+            d_depth_.data, d_depth_normals_.data,
+            d_corrs_.data, d_num_valid_.data,
+            params_.cam.width, params_.cam.height,
+            params_.cam, T_cam_world,
+            d_pixel_knn_.data, d_pixel_knn_w_.data,
+            params_.dist_threshold, params_.angle_threshold);
+        cudaDeviceSynchronize();
+
+        int h_valid = 0;
+        cudaMemcpy(&h_valid, d_num_valid_.data, sizeof(int), cudaMemcpyDeviceToHost);
+        return h_valid;
     }
 };
 
+struct AppConfig
+{
+    DepthSequence::Config seq;
+    DynamicFusionPipeline::Params df;
+    bool use_vis = false;
+};
+
+AppConfig load_config(const std::string &path)
+{
+    YAML::Node cfg = YAML::LoadFile(path);
+    AppConfig out;
+
+    // ───── sequence ─────
+    auto s = cfg["sequence"];
+    out.seq.path = s["path"].as<std::string>();
+
+    std::string fmt = s["format"].as<std::string>();
+    if (fmt == "tum")
+        out.seq.format = DepthSequence::Format::TUM;
+    else if (fmt == "icl")
+        out.seq.format = DepthSequence::Format::ICL;
+    else
+        out.seq.format = DepthSequence::Format::RAW_PNG;
+
+    out.seq.depth_scale = s["depth_scale"].as<float>();
+    out.seq.start_frame = s["start_frame"].as<int>();
+    out.seq.max_frames = s["max_frames"].as<int>();
+
+    // ───── camera ─────
+    auto c = cfg["camera"];
+    out.seq.cam.fx = c["fx"].as<float>();
+    out.seq.cam.fy = c["fy"].as<float>();
+    out.seq.cam.cx = c["cx"].as<float>();
+    out.seq.cam.cy = c["cy"].as<float>();
+    out.seq.cam.width = c["width"].as<int>();
+    out.seq.cam.height = c["height"].as<int>();
+
+    out.df.cam = out.seq.cam;
+
+    // ───── tsdf ─────
+    auto t = cfg["tsdf"];
+    auto dims = read_vec_i(t["dims"]);
+    out.df.tsdf.dims = {dims[0], dims[1], dims[2]};
+    out.df.tsdf.voxel_size = t["voxel_size"].as<float>();
+    out.df.tsdf.truncation = t["truncation"].as<float>();
+    auto origin = read_vec_f(t["origin"]);
+    out.df.tsdf.origin = make_float3(origin[0], origin[1], origin[2]);
+
+    // ───── solver ─────
+    auto sol = cfg["solver"];
+    out.df.solver.gn_iterations = sol["gn_iterations"].as<int>();
+    out.df.solver.pcg_iterations = sol["pcg_iterations"].as<int>();
+    out.df.solver.lambda_smooth = sol["lambda_smooth"].as<float>();
+
+    // ───── warp ─────
+    auto w = cfg["warp"];
+    out.df.node_radius = w["node_radius"].as<float>();
+    out.df.node_min_dist = w["node_min_dist"].as<float>();
+    out.df.max_nodes = w["max_nodes"].as<int>();
+
+    // ───── icp ─────
+    auto icp = cfg["icp"];
+    out.df.dist_threshold = icp["dist_threshold"].as<float>();
+    out.df.angle_threshold = icp["angle_threshold"].as<float>();
+
+    // ───── bbox ─────
+    auto b = cfg["bbox"];
+    out.df.bbox.enabled = b["enabled"].as<bool>();
+    auto bmin = read_vec_f(b["min_pt"]);
+    auto bmax = read_vec_f(b["max_pt"]);
+    out.df.bbox.min_pt = make_float3(bmin[0], bmin[1], bmin[2]);
+    out.df.bbox.max_pt = make_float3(bmax[0], bmax[1], bmax[2]);
+
+    // ───── visualizer ─────
+    out.use_vis = cfg["visualizer"]["enabled"].as<bool>();
+
+    return out;
+}
 // ─────────────────────────────────────────────
 //  Main
 // ─────────────────────────────────────────────
@@ -455,35 +882,44 @@ int main(int argc, char **argv)
 {
     std::cout << "=== DynamicFusion CUDA Implementation ===\n\n";
 
-    // ── Configurazione ────────────────────────
+    // ─────────────────────────────────────────────
+    // CONFIG
+    // ─────────────────────────────────────────────
 
-    DepthSequence::Config seq_cfg;
+    AppConfig app;
+    bool use_config_file = (argc >= 2);
 
-    if (argc >= 2)
+    if (use_config_file && fs::exists(argv[1]))
     {
-        seq_cfg.path = argv[1];
+        std::cout << "[Info] Loading config: " << argv[1] << "\n";
+        app = load_config(argv[1]);
     }
     else
     {
-        // Dataset di test sintetico: genera depth maps procedurali
-        std::cout << "[Info] Nessun dataset specificato.\n"
-                  << "  Uso: " << argv[0] << " <path_dataset> [format]\n"
-                  << "  Formati: tum (default), icl, raw\n"
-                  << "  Generando sequenza sintetica...\n\n";
+        std::cout << "[Info] Nessun config YAML valido.\n"
+                  << "Uso sequenza sintetica...\n\n";
 
-        // Crea cartella temporanea con depth maps sintetiche
+        // ── Sequenza sintetica ─────────────────────
         fs::create_directories("/tmp/df_test/depth");
+
         int W = 640, H = 480;
+
         for (int f = 0; f < 30; f++)
         {
             cv::Mat depth(H, W, CV_16U);
-            // Sfera che si muove lentamente
-            float cx = W / 2 + f * 2, cy = H / 2, r = 150;
+
+            float cx = W / 2 + f * 2;
+            float cy = H / 2;
+            float r = 150;
+
             for (int v = 0; v < H; v++)
+            {
                 for (int u = 0; u < W; u++)
                 {
-                    float dx = u - cx, dy = v - cy;
+                    float dx = u - cx;
+                    float dy = v - cy;
                     float d2 = dx * dx + dy * dy;
+
                     if (d2 < r * r)
                     {
                         float z = 1.5f - sqrtf(r * r - d2) / 1000.f;
@@ -494,81 +930,99 @@ int main(int argc, char **argv)
                         depth.at<uint16_t>(v, u) = 0;
                     }
                 }
+            }
+
             std::string fname = "/tmp/df_test/depth/" +
                                 std::to_string(f) + ".png";
+
             cv::imwrite(fname, depth);
         }
-        seq_cfg.path = "/tmp/df_test/depth";
-        seq_cfg.format = DepthSequence::Format::RAW_PNG;
+
+        // fallback config
+        app.seq.path = "/tmp/df_test/depth";
+        app.seq.format = DepthSequence::Format::RAW_PNG;
+        app.seq.depth_scale = 0.001f;
+        app.seq.start_frame = 0;
+        app.seq.max_frames = -1;
+
+        app.seq.cam.fx = 570.342f;
+        app.seq.cam.fy = 570.342f;
+        app.seq.cam.cx = 320.0f;
+        app.seq.cam.cy = 240.0f;
+        app.seq.cam.width = 640;
+        app.seq.cam.height = 480;
+
+        app.use_vis = false;
     }
 
-    // Parse remaining args: format + --vis
-    bool use_vis = false;
+    // ─────────────────────────────────────────────
+    // CLI overrides (solo vis + format override)
+    // ─────────────────────────────────────────────
+
     for (int i = 2; i < argc; i++)
     {
         std::string a = argv[i];
+
         if (a == "--vis")
         {
-            use_vis = true;
+            app.use_vis = true;
+        }
+        else if (a == "--debug-vis")
+        {
+            app.df.debug_vis = true;
+        }
+        else if (a == "--debug-every" && i + 1 < argc)
+        {
+            app.df.debug_every_n = std::stoi(argv[++i]);
         }
         else if (a == "tum")
         {
-            seq_cfg.format = DepthSequence::Format::TUM;
+            app.seq.format = DepthSequence::Format::TUM;
         }
         else if (a == "icl")
         {
-            seq_cfg.format = DepthSequence::Format::ICL;
+            app.seq.format = DepthSequence::Format::ICL;
         }
         else if (a == "raw")
         {
-            seq_cfg.format = DepthSequence::Format::RAW_PNG;
+            app.seq.format = DepthSequence::Format::RAW_PNG;
         }
     }
 
-    // Intrinseci camera (default: TUM fr1)
-    seq_cfg.cam.fx = 570.342f;
-    seq_cfg.cam.fy = 570.342f;
-    seq_cfg.cam.cx = 320.0f;
-    seq_cfg.cam.cy = 240.0f;
-    seq_cfg.cam.width = 640;
-    seq_cfg.cam.height = 480;
+    // ─────────────────────────────────────────────
+    // PIPELINE PARAMS
+    // ─────────────────────────────────────────────
 
-    // ── Pipeline params ───────────────────────
+    DynamicFusionPipeline::Params df_params = app.df;
+    df_params.cam = app.seq.cam;
 
-    DynamicFusionPipeline::Params df_params;
-    df_params.cam = seq_cfg.cam;
+    // ─────────────────────────────────────────────
+    // SEQUENCE + PIPELINE
+    // ─────────────────────────────────────────────
 
-    df_params.tsdf.dims = {256, 256, 256};
-    df_params.tsdf.voxel_size = 0.01f;
-    df_params.tsdf.truncation = 0.03f;
-    df_params.tsdf.origin = {-0.768f, -0.768f, 0.3f};
-
-    df_params.solver.gn_iterations = 3;
-    df_params.solver.pcg_iterations = 10;
-    df_params.solver.lambda_smooth = 5.0f;
-
-    df_params.node_radius = 0.05f;
-    df_params.node_min_dist = 0.025f;
-
-    // ── Carica sequenza ───────────────────────
-
-    DepthSequence sequence(seq_cfg);
-
-    // ── Inizializza pipeline ──────────────────
-
+    DepthSequence sequence(app.seq);
     DynamicFusionPipeline pipeline(df_params);
 
-    // ── Visualizer setup ──────────────────────
+    // ─────────────────────────────────────────────
+    // VISUALIZER
+    // ─────────────────────────────────────────────
 
     std::shared_ptr<open3d::visualization::Visualizer> vis;
     std::shared_ptr<open3d::geometry::TriangleMesh> vis_mesh;
 
-    if (use_vis)
+    if (app.use_vis)
     {
         vis = std::make_shared<open3d::visualization::Visualizer>();
         vis->CreateVisualizerWindow("DynamicFusion", 1920, 1080);
+
         vis->GetRenderOption().mesh_show_back_face_ = true;
+
         vis_mesh = std::make_shared<open3d::geometry::TriangleMesh>();
+
+        auto ref_frame =
+            open3d::geometry::TriangleMesh::CreateCoordinateFrame(0.3);
+
+        vis->AddGeometry(ref_frame);
     }
 
     // ── Loop principale ───────────────────────
@@ -578,6 +1032,7 @@ int main(int argc, char **argv)
 
     while (sequence.has_next())
     {
+        auto t0 = std::chrono::high_resolution_clock::now();
         DepthFrame frame = sequence.next();
 
         if (frame.depth_m.empty())
@@ -591,7 +1046,7 @@ int main(int argc, char **argv)
         frame_idx++;
 
         // Vis update every frame
-        if (use_vis)
+        if (app.use_vis)
         {
             if (frame_idx == 1)
             {
@@ -600,24 +1055,35 @@ int main(int argc, char **argv)
                           << " vertici, " << vis_mesh->triangles_.size() << " triangoli\n";
                 vis->AddGeometry(vis_mesh);
             }
-            pipeline.update_o3d_mesh(*vis_mesh);
-            vis->UpdateGeometry(vis_mesh);
-            // vis->GetRenderOption().mesh_show_wireframe_ = true;
-            vis->PollEvents();
-            vis->UpdateRender();
+            if (frame_idx % 5 == 0)
+            {
+                pipeline.update_o3d_mesh(*vis_mesh);
+                vis->UpdateGeometry(vis_mesh);
+                // vis->GetRenderOption().mesh_show_wireframe_ = true;
+                vis->PollEvents();
+                vis->UpdateRender();
+            }
         }
 
         // Salva mesh ogni 30 frame
         if (frame_idx % 30 == 0)
         {
-            std::string path = "mesh_frame_" +
-                               std::to_string(frame_idx) + ".ply";
-            pipeline.save_mesh_ply(path);
+            std::string path = "mesh_frame_" + std::to_string(frame_idx);
+            pipeline.save_mesh_ply(path + "_canonical.ply");
+            pipeline.save_warped_mesh_ply(path + "_warped.ply");
         }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout << "Frame " << std::setw(4) << frame_idx
+                  << " processato in " << std::fixed << std::setprecision(1)
+                  << ms << " ms\n";
+        std::cout << "------------------" << std::endl;
     }
 
-    if (use_vis)
+    if (app.use_vis)
+    {
         vis->DestroyVisualizerWindow();
+    }
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double total_s = std::chrono::duration<double>(t_end - t_start).count();
@@ -630,7 +1096,8 @@ int main(int argc, char **argv)
               << frame_idx / total_s << "\n";
 
     // Mesh finale
-    pipeline.save_mesh_ply("mesh_final.ply");
+    pipeline.save_mesh_ply("mesh_final_canonical.ply");
+    pipeline.save_warped_mesh_ply("mesh_final_warped.ply");
 
     return 0;
 }
