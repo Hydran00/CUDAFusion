@@ -47,7 +47,7 @@ __global__ void assemble_data_term_kernel(
 
         // Jacobiana riga per nodo i
         float Ji[6];
-        compute_jacobian_row(src, normal, w_i, Ji);
+        compute_jacobian_row(src, nodes[ni].pos, normal, w_i, Ji);
 
         // Contributo a b: J_i^T * r
         for (int a = 0; a < 6; a++)
@@ -68,7 +68,7 @@ __global__ void assemble_data_term_kernel(
 
             // Jacobiana per nodo j
             float Jj[6];
-            compute_jacobian_row(src, normal, w_j, Jj);
+            compute_jacobian_row(src, nodes[nj].pos, normal, w_j, Jj);
 
             // Accumula J_i^T * J_j nel blocco (ni, nj)
             float* blk = A_values + block_pos * BLOCK_SIZE;
@@ -103,6 +103,25 @@ __device__ int find_block(
         if (col_idx[r] == col) return r;
     return -1;
 }
+
+__global__ void add_diagonal_damping_kernel(
+    float*      A_values,
+    const int*  row_ptr,
+    const int*  col_idx,
+    int         num_nodes,
+    float       lambda)
+{
+    int ni = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ni >= num_nodes) return;
+
+    int blk = find_block(ni, ni, row_ptr, col_idx);
+    if (blk < 0) return;
+
+    float* diag = A_values + blk * BLOCK_SIZE;
+    for (int k = 0; k < BLOCK_DIM; k++)
+        diag[k * BLOCK_DIM + k] += lambda;
+}
+
 // ─────────────────────────────────────────────
 //  Kernel: termine smoothness ARAP
 //  Per ogni arco (i,j) del grafo:
@@ -130,8 +149,8 @@ __global__ void assemble_smooth_term_kernel(
 
         float3 xj = nodes[nj].pos;
 
-        float3 Ti_xj = transforms[ni].transform_point(xj);
-        float3 Tj_xj = transforms[nj].transform_point(xj);
+        float3 Ti_xj = transforms[ni].transform_point_centered(xj, node_i.pos);
+        float3 Tj_xj = transforms[nj].transform_point_centered(xj, nodes[nj].pos);
 
         float3 r = make_float3(
             Ti_xj.x - Tj_xj.x,
@@ -140,10 +159,15 @@ __global__ void assemble_smooth_term_kernel(
 
         float Ji[6][3], Jj[6][3];
 
-        compute_arap_jacobian(Ti_xj, Ji);
-        compute_arap_jacobian(Tj_xj, Jj);
+        float3 qi = make_float3(Ti_xj.x - node_i.pos.x,
+                                 Ti_xj.y - node_i.pos.y,
+                                 Ti_xj.z - node_i.pos.z);
+        float3 qj = make_float3(Tj_xj.x - nodes[nj].pos.x,
+                                 Tj_xj.y - nodes[nj].pos.y,
+                                 Tj_xj.z - nodes[nj].pos.z);
 
-        if (nj <= ni) continue; 
+        compute_arap_jacobian(qi, Ji);
+        compute_arap_jacobian(qj, Jj);
 
         int ii = find_block(ni, ni, row_ptr, col_idx);
         int jj = find_block(nj, nj, row_ptr, col_idx);
@@ -342,19 +366,28 @@ GaussNewtonSolver::GaussNewtonSolver(const Params& p, int max_nodes)
 void GaussNewtonSolver::build_sparsity_pattern(
     const DeformNode* h_nodes, int num_nodes)
 {
-    // Each row i: diagonal block (i,i) + one block per graph neighbor
+    // Each row contains the diagonal plus graph-neighbor blocks in both
+    // directions. PCG expects a symmetric system; the node graph is stored
+    // directionally because new nodes only point to previous neighbors.
+    std::vector<std::vector<int>> row_cols(num_nodes);
+    for (int i = 0; i < num_nodes; i++)
+        row_cols[i].push_back(i);
+
+    for (int i = 0; i < num_nodes; i++) {
+        for (int k = 0; k < h_nodes[i].num_neighbors; k++) {
+            int nb = h_nodes[i].neighbors[k];
+            if (nb < 0 || nb >= num_nodes) continue;
+            row_cols[i].push_back(nb);
+            row_cols[nb].push_back(i);
+        }
+    }
+
     h_row_ptr_.resize(num_nodes + 1);
     h_col_idx_.clear();
 
     for (int i = 0; i < num_nodes; i++) {
         h_row_ptr_[i] = (int)h_col_idx_.size();
-        // Collect sorted unique col indices: diagonal + neighbors
-        std::vector<int> cols;
-        cols.push_back(i);
-        for (int k = 0; k < h_nodes[i].num_neighbors; k++) {
-            int nb = h_nodes[i].neighbors[k];
-            if (nb >= 0 && nb < num_nodes) cols.push_back(nb);
-        }
+        std::vector<int>& cols = row_cols[i];
         std::sort(cols.begin(), cols.end());
         cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
         for (int c : cols) h_col_idx_.push_back(c);
@@ -386,17 +419,13 @@ void GaussNewtonSolver::solve(
                num_nodes * sizeof(DeformNode), cudaMemcpyDeviceToHost);
     build_sparsity_pattern(h_nodes.data(), num_nodes);
 
-    for (int gn = 0; gn < params_.gn_iterations; gn++) {
-        // 1. Assembla sistema
-        assemble_system(corrs, num_corrs, d_nodes, d_transforms, num_nodes);
-
-        // 2. Precondizionatore
-        compute_preconditioner(num_nodes);
-
-        // 3. PCG
-        delta_x.zero();
-        pcg_solve(num_nodes, delta_x);
-    }
+    // One linearization per frame. Repeating this loop without applying the
+    // update and re-raycasting solves the same system again and can only waste
+    // time; the caller applies the returned increment once.
+    assemble_system(corrs, num_corrs, d_nodes, d_transforms, num_nodes);
+    compute_preconditioner(num_nodes);
+    delta_x.zero();
+    pcg_solve(num_nodes, delta_x);
 }
 
 void GaussNewtonSolver::assemble_system(
@@ -425,6 +454,10 @@ void GaussNewtonSolver::assemble_system(
         params_.lambda_smooth,
         A_.values.data, b_.data,
         A_.row_ptr.data, A_.col_idx.data);
+
+    add_diagonal_damping_kernel<<<grid_nodes, block>>>(
+        A_.values.data, A_.row_ptr.data, A_.col_idx.data,
+        num_nodes, params_.lambda_damping);
 
     cudaDeviceSynchronize();
 }

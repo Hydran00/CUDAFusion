@@ -277,12 +277,12 @@ void TSDFVolume::extract_surface(std::vector<float3>& out_vertices,
       float va = cv[a], vb = cv[b];
       float t = (fabsf(vb - va) > 1e-7f) ? (-va / (vb - va)) : 0.5f;
       t = fmaxf(0.f, fminf(1.f, t));
-      float ax = params_.origin.x + (ix+co[a][0])*vs;
-      float ay = params_.origin.y + (iy+co[a][1])*vs;
-      float az = params_.origin.z + (iz+co[a][2])*vs;
-      float bx = params_.origin.x + (ix+co[b][0])*vs;
-      float by = params_.origin.y + (iy+co[b][1])*vs;
-      float bz = params_.origin.z + (iz+co[b][2])*vs;
+      float ax = params_.origin.x + (ix+co[a][0] + 0.5f)*vs;
+      float ay = params_.origin.y + (iy+co[a][1] + 0.5f)*vs;
+      float az = params_.origin.z + (iz+co[a][2] + 0.5f)*vs;
+      float bx = params_.origin.x + (ix+co[b][0] + 0.5f)*vs;
+      float by = params_.origin.y + (iy+co[b][1] + 0.5f)*vs;
+      float bz = params_.origin.z + (iz+co[b][2] + 0.5f)*vs;
       edge_verts[e] = make_float3(ax + t*(bx-ax), ay + t*(by-ay), az + t*(bz-az));
     }
 

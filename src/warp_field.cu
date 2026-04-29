@@ -91,7 +91,35 @@ __global__ void apply_twist_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_nodes) return;
 
-    Mat4 dT = exp_se3(&delta_x[i * 6]);
+    float twist[6];
+    #pragma unroll
+    for (int k = 0; k < 6; k++)
+        twist[k] = delta_x[i * 6 + k];
+
+    const float max_rot = 0.005f;   // rad per frame
+    const float max_trans = 0.002f; // metres per frame
+
+    float rot_norm = sqrtf(twist[0] * twist[0] +
+                           twist[1] * twist[1] +
+                           twist[2] * twist[2]);
+    if (rot_norm > max_rot) {
+        float s = max_rot / rot_norm;
+        twist[0] *= s;
+        twist[1] *= s;
+        twist[2] *= s;
+    }
+
+    float trans_norm = sqrtf(twist[3] * twist[3] +
+                             twist[4] * twist[4] +
+                             twist[5] * twist[5]);
+    if (trans_norm > max_trans) {
+        float s = max_trans / trans_norm;
+        twist[3] *= s;
+        twist[4] *= s;
+        twist[5] *= s;
+    }
+
+    Mat4 dT = exp_se3(twist);
     transforms[i] = dT * transforms[i];
 }
 
@@ -129,9 +157,9 @@ __global__ void compute_voxel_knn_kernel(
     }
 
     float3 p = make_float3(
-        origin.x + vx * voxel_size,
-        origin.y + vy * voxel_size,
-        origin.z + vz * voxel_size);
+        origin.x + (vx + 0.5f) * voxel_size,
+        origin.y + (vy + 0.5f) * voxel_size,
+        origin.z + (vz + 0.5f) * voxel_size);
 
     float best_dist[K_NEIGHBORS];
     int   best_id  [K_NEIGHBORS];

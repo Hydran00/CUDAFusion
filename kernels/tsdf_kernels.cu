@@ -3,6 +3,80 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
+namespace {
+
+__device__ __forceinline__
+int voxel_index(int x, int y, int z, int3 dims)
+{
+    return z * dims.x * dims.y + y * dims.x + x;
+}
+
+__device__ __forceinline__
+bool sample_tsdf_trilinear(
+    const TSDFVoxel* voxels,
+    int3             dims,
+    float3           origin,
+    float            voxel_size,
+    float3           p_world,
+    float&           tsdf,
+    int&             base_vidx)
+{
+    float gx = (p_world.x - origin.x) / voxel_size;
+    float gy = (p_world.y - origin.y) / voxel_size;
+    float gz = (p_world.z - origin.z) / voxel_size;
+
+    int x0 = __float2int_rd(gx);
+    int y0 = __float2int_rd(gy);
+    int z0 = __float2int_rd(gz);
+
+    if (x0 < 0 || x0 >= dims.x - 1 ||
+        y0 < 0 || y0 >= dims.y - 1 ||
+        z0 < 0 || z0 >= dims.z - 1)
+        return false;
+
+    float fx = gx - x0;
+    float fy = gy - y0;
+    float fz = gz - z0;
+
+    float accum = 0.0f;
+    #pragma unroll
+    for (int dz = 0; dz <= 1; dz++) {
+        float wz = dz ? fz : (1.0f - fz);
+        #pragma unroll
+        for (int dy = 0; dy <= 1; dy++) {
+            float wy = dy ? fy : (1.0f - fy);
+            #pragma unroll
+            for (int dx = 0; dx <= 1; dx++) {
+                float wx = dx ? fx : (1.0f - fx);
+                int idx = voxel_index(x0 + dx, y0 + dy, z0 + dz, dims);
+                if (voxels[idx].weight <= 0.0f)
+                    return false;
+                accum += wx * wy * wz * voxels[idx].tsdf;
+            }
+        }
+    }
+
+    tsdf = accum;
+    base_vidx = voxel_index(x0, y0, z0, dims);
+    return true;
+}
+
+__device__ __forceinline__
+bool sample_tsdf_value(
+    const TSDFVoxel* voxels,
+    int3             dims,
+    float3           origin,
+    float            voxel_size,
+    float3           p_world,
+    float&           tsdf)
+{
+    int unused = -1;
+    return sample_tsdf_trilinear(voxels, dims, origin, voxel_size,
+                                 p_world, tsdf, unused);
+}
+
+} // namespace
+
 // ─────────────────────────────────────────────
 //  Kernel: integrazione depth nel TSDF
 // ─────────────────────────────────────────────
@@ -36,9 +110,9 @@ __global__ void tsdf_integrate_kernel(
 
     // Posizione mondo del voxel
     float3 p_world = make_float3(
-        origin.x + vx * voxel_size,
-        origin.y + vy * voxel_size,
-        origin.z + vz * voxel_size);
+        origin.x + (vx + 0.5f) * voxel_size,
+        origin.y + (vy + 0.5f) * voxel_size,
+        origin.z + (vz + 0.5f) * voxel_size);
 
     // Se c'è il warp field, deforma il punto prima di proiettare
     float3 p_live = p_world;
@@ -114,7 +188,9 @@ __global__ void compute_depth_normals_kernel(
     float3 dx = make_float3(p_r.x-p.x, p_r.y-p.y, p_r.z-p.z);
     float3 dy = make_float3(p_u.x-p.x, p_u.y-p.y, p_u.z-p.z);
 
-    float3 n = cross3(dy, dx);
+    // Orient depth normals toward the camera, matching the TSDF gradient
+    // convention used by raycasting.
+    float3 n = cross3(dx, dy);
     normals[v*w+u] = normalize3(n);
 }
 
@@ -158,12 +234,13 @@ __global__ void raycast_kernel(
     float3 ray_dir     = normalize3(T_world_cam.transform_normal(ray_d_cam));
 
     // Marching lungo il raggio
-    float t     = 0.3f;  // start depth
+    float t     = 0.05f; // start depth
     float t_max = 3.5f;
     float step  = voxel_size * 0.8f;
 
     float tsdf_prev = 0;
-    bool  found_zero_crossing = false;
+    bool  have_prev = false;
+    float t_prev = t;
 
     for (; t < t_max; t += step) {
         float3 p_world = make_float3(
@@ -171,46 +248,46 @@ __global__ void raycast_kernel(
             ray_origin.y + t * ray_dir.y,
             ray_origin.z + t * ray_dir.z);
 
-        // Coordinate voxel
-        int vx = __float2int_rn((p_world.x - origin.x) / voxel_size);
-        int vy = __float2int_rn((p_world.y - origin.y) / voxel_size);
-        int vz = __float2int_rn((p_world.z - origin.z) / voxel_size);
-
-        if (vx < 0 || vx >= dims.x ||
-            vy < 0 || vy >= dims.y ||
-            vz < 0 || vz >= dims.z) continue;
-
-        int vidx = vz * dims.x * dims.y + vy * dims.x + vx;
-        const TSDFVoxel& voxel = voxels[vidx];
-
-        if (voxel.weight <= 0) { tsdf_prev = 0; continue; }
-
-        float tsdf_cur = voxel.tsdf;
+        float tsdf_cur = 1.0f;
+        int vidx = -1;
+        if (!sample_tsdf_trilinear(voxels, dims, origin, voxel_size,
+                                   p_world, tsdf_cur, vidx)) {
+            have_prev = false;
+            continue;
+        }
 
         // Zero crossing: tsdf cambia segno
-        if (tsdf_prev > 0 && tsdf_cur <= 0 && tsdf_prev < 1.0f) {
+        if (have_prev && tsdf_prev > 0 && tsdf_cur <= 0 && tsdf_prev < 1.0f) {
             // Interpolazione lineare per trovare la superficie esatta
-            float t_surface = t - step * tsdf_cur / (tsdf_cur - tsdf_prev);
+            float t_surface = t - (t - t_prev) * tsdf_cur / (tsdf_cur - tsdf_prev);
 
             float3 p_surface = make_float3(
                 ray_origin.x + t_surface * ray_dir.x,
                 ray_origin.y + t_surface * ray_dir.y,
                 ray_origin.z + t_surface * ray_dir.z);
 
-            // Normale via gradiente del TSDF
-            // (differenze finite sui voxel vicini)
-            float3 grad;
-            auto sample = [&](int dx, int dy, int dz) -> float {
-                int nx = vx+dx, ny = vy+dy, nz = vz+dz;
-                if (nx<0||nx>=dims.x||ny<0||ny>=dims.y||nz<0||nz>=dims.z)
-                    return 0;
-                int ni = nz*dims.x*dims.y + ny*dims.x + nx;
-                return voxels[ni].weight > 0 ? voxels[ni].tsdf : 0;
-            };
+            // Normale via gradiente trilineare del TSDF.
+            float sxp, sxm, syp, sym, szp, szm;
+            bool ok_grad =
+                sample_tsdf_value(voxels, dims, origin, voxel_size,
+                                  make_float3(p_surface.x + voxel_size, p_surface.y, p_surface.z), sxp) &&
+                sample_tsdf_value(voxels, dims, origin, voxel_size,
+                                  make_float3(p_surface.x - voxel_size, p_surface.y, p_surface.z), sxm) &&
+                sample_tsdf_value(voxels, dims, origin, voxel_size,
+                                  make_float3(p_surface.x, p_surface.y + voxel_size, p_surface.z), syp) &&
+                sample_tsdf_value(voxels, dims, origin, voxel_size,
+                                  make_float3(p_surface.x, p_surface.y - voxel_size, p_surface.z), sym) &&
+                sample_tsdf_value(voxels, dims, origin, voxel_size,
+                                  make_float3(p_surface.x, p_surface.y, p_surface.z + voxel_size), szp) &&
+                sample_tsdf_value(voxels, dims, origin, voxel_size,
+                                  make_float3(p_surface.x, p_surface.y, p_surface.z - voxel_size), szm);
+            if (!ok_grad)
+                break;
 
-            grad.x = sample(1,0,0) - sample(-1,0,0);
-            grad.y = sample(0,1,0) - sample(0,-1,0);
-            grad.z = sample(0,0,1) - sample(0,0,-1);
+            float3 grad;
+            grad.x = sxp - sxm;
+            grad.y = syp - sym;
+            grad.z = szp - szm;
             float3 normal = normalize3(grad);
 
             // Output canonical voxel index for pixel_knn lookup
@@ -222,15 +299,17 @@ __global__ void raycast_kernel(
                 const int*   knn   = voxel_knn   + vidx * K_NEIGHBORS;
                 const float* knn_w = voxel_knn_w + vidx * K_NEIGHBORS;
                 p_live = warp_point(p_surface, nodes, transforms, knn, knn_w);
+                normal = warp_normal(normal, transforms, knn, knn_w);
             }
 
             out_vertices[px_idx] = p_live;
             out_normals [px_idx] = normal;
-            found_zero_crossing  = true;
             break;
         }
 
         tsdf_prev = tsdf_cur;
+        have_prev = true;
+        t_prev = t;
         // Adaptive step: più piccolo vicino alla superficie
         if (fabsf(tsdf_cur) < 0.5f)
             step = voxel_size * 0.5f;
@@ -276,7 +355,8 @@ __global__ void find_correspondences_kernel(
     const int*         pixel_knn,       // [H*W*K] — nodi per pixel
     const float*       pixel_knn_w,
     float              dist_threshold,
-    float              angle_threshold)
+    float              angle_threshold,
+    int*               debug_stats)
 {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     int v = blockIdx.y * blockDim.y + threadIdx.y;
@@ -290,34 +370,53 @@ __global__ void find_correspondences_kernel(
     float3 v_live = live_vertices[px];
     float3 n_live = live_normals[px];
 
-    if (norm3(v_live) < 1e-6f || norm3(n_live) < 1e-6f) goto store;
+    if (norm3(v_live) < 1e-6f || norm3(n_live) < 1e-6f) {
+        if (debug_stats) atomicAdd(&debug_stats[0], 1);
+        goto store;
+    }
 
     {
         // Proietta vertice live nel depth frame
         float3 v_cam = T_cam_world.transform_point(v_live);
-        if (v_cam.z <= 0) goto store;
+        if (v_cam.z <= 0) {
+            if (debug_stats) atomicAdd(&debug_stats[1], 1);
+            goto store;
+        }
 
         float2 proj = cam.project(v_cam);
         int pu = __float2int_rn(proj.x);
         int pv = __float2int_rn(proj.y);
 
-        if (pu < 0 || pu >= img_w || pv < 0 || pv >= img_h) goto store;
+        if (pu < 0 || pu >= img_w || pv < 0 || pv >= img_h) {
+            if (debug_stats) atomicAdd(&debug_stats[1], 1);
+            goto store;
+        }
 
         float d_dst = depth_map[pv * img_w + pu];
-        if (d_dst <= 0) goto store;
+        if (d_dst <= 0) {
+            if (debug_stats) atomicAdd(&debug_stats[2], 1);
+            goto store;
+        }
 
         float3 v_dst   = cam.unproject(pu, pv, d_dst);
         float3 n_dst   = depth_normals[pv * img_w + pu];
+        float3 n_cam   = T_cam_world.transform_normal(n_live);
 
         // Filtra per distanza e angolo
-        float3 diff = make_float3(v_live.x - v_dst.x,
-                                   v_live.y - v_dst.y,
-                                   v_live.z - v_dst.z);
+        float3 diff = make_float3(v_cam.x - v_dst.x,
+                       v_cam.y - v_dst.y,
+                       v_cam.z - v_dst.z);
         float dist = norm3(diff);
-        if (dist > dist_threshold) goto store;
+        if (dist > dist_threshold) {
+            if (debug_stats) atomicAdd(&debug_stats[3], 1);
+            goto store;
+        }
 
-        float cosine = fabsf(dot3(n_live, n_dst));
-        if (cosine < angle_threshold) goto store;
+        float cosine = dot3(n_cam, n_dst);
+        if (cosine < angle_threshold) {
+            if (debug_stats) atomicAdd(&debug_stats[4], 1);
+            goto store;
+        }
 
         // Salva corrispondenza
         corr.src    = v_live;
@@ -333,6 +432,7 @@ __global__ void find_correspondences_kernel(
         }
 
         atomicAdd(num_valid, 1);
+        if (debug_stats) atomicAdd(&debug_stats[5], 1);
     }
 
 store:

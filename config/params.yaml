@@ -1,5 +1,5 @@
 sequence:
-  path: "/media/nardi/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/boxing"
+  path: "/media/nardi/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/Umbrella"
   format: "tum"   # tum | icl | raw
   depth_scale: 0.001
   start_frame: 0
@@ -17,26 +17,31 @@ tsdf:
   dims: [256, 256, 256]
   voxel_size: 0.006
   truncation: 0.03
-  origin: [-0.768, -0.768, 0.3]
+  origin: [-0.768, -0.768, 0.05]
 
 solver:
-  gn_iterations: 100
-  pcg_iterations: 100
-  lambda_smooth: 1.0
+  gn_iterations: 1
+  pcg_iterations: 30
+  lambda_smooth: 200.0
+  lambda_damping: 0.05
 
 warp:
-  node_radius: 0.05
-  node_min_dist: 0.025
+  node_radius: 0.08
+  node_min_dist: 0.04
   max_nodes: 4096
+  node_update_every_n: 0
+  max_dx_mean: 0.03
+  integrate_warped: false
 
 icp:
-  dist_threshold: 0.05
-  angle_threshold: 0.7
+  dist_threshold: 0.025
+  angle_threshold: 0.85
+  min_valid_corrs: 10000
 
 bbox:
   enabled: true
-  min_pt: [-1.0, -1.0, 0.1]
-  max_pt: [0.5, 0.5, 0.8]
+  min_pt: [-1.0, -1.0, 0.01]
+  max_pt: [1.0, 1.0, 2.0]
 
 visualizer:
   enabled: true

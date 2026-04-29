@@ -15,6 +15,7 @@ class GaussNewtonSolver {
     float pcg_tolerance = 1e-4f;
     float lambda_smooth = 1.0f;  // peso termine smoothness (ARAP)
     float lambda_rot = 1.0f;     // peso penalità rotazione
+    float lambda_damping = 1e-2f; // Levenberg damping on the solved system
   };
 
   explicit GaussNewtonSolver(const Params& p, int max_nodes);

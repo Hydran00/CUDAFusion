@@ -60,7 +60,8 @@ __global__ void find_correspondences_kernel(
     const int*         pixel_knn,
     const float*       pixel_knn_w,
     float              dist_threshold,
-    float              angle_threshold);
+    float              angle_threshold,
+    int*               debug_stats);
 
 __global__ void compute_pixel_knn_kernel(
     const int*    canonical_vidx,

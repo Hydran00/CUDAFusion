@@ -4,6 +4,20 @@
 #include <vector>
 #include <cassert>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+
+// ─────────────────────────────────────────────
+//  Helper: CUDA error check
+// ─────────────────────────────────────────────
+
+#define CUDA_CHECK(call)  do { \
+    cudaError_t err = call;    \
+    if (err != cudaSuccess) {  \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", \
+            __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(1); \
+    } } while(0)
 
 // ─────────────────────────────────────────────
 //  Math primitives
@@ -25,6 +39,14 @@ struct Mat4 {
         float y = m[1][0]*p.x + m[1][1]*p.y + m[1][2]*p.z + m[1][3];
         float z = m[2][0]*p.x + m[2][1]*p.y + m[2][2]*p.z + m[2][3];
         return make_float3(x, y, z);
+    }
+
+    __host__ __device__ float3 transform_point_centered(float3 p, float3 center) const {
+        float3 rp = transform_point(p);
+        float3 rc = transform_normal(center);
+        return make_float3(rp.x + center.x - rc.x,
+                           rp.y + center.y - rc.y,
+                           rp.z + center.z - rc.z);
     }
 
     __host__ __device__ float3 transform_normal(float3 n) const {
@@ -86,23 +108,23 @@ struct DeviceArray {
         free();
         count = n;
         if (n > 0)
-            cudaMalloc(&data, n * sizeof(T));
+            CUDA_CHECK(cudaMalloc(&data, n * sizeof(T)));
     }
 
     void free() {
-        if (data) { cudaFree(data); data = nullptr; count = 0; }
+        if (data) { CUDA_CHECK(cudaFree(data)); data = nullptr; count = 0; }
     }
 
-    void zero() { cudaMemset(data, 0, count * sizeof(T)); }
+    void zero() { CUDA_CHECK(cudaMemset(data, 0, count * sizeof(T))); }
 
     void upload(const std::vector<T>& v) {
         if (count != v.size()) allocate(v.size());
-        cudaMemcpy(data, v.data(), count * sizeof(T), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(data, v.data(), count * sizeof(T), cudaMemcpyHostToDevice));
     }
 
     void download(std::vector<T>& v) const {
         v.resize(count);
-        cudaMemcpy(v.data(), data, count * sizeof(T), cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(v.data(), data, count * sizeof(T), cudaMemcpyDeviceToHost));
     }
 
     size_t size() const { return count; }
@@ -206,18 +228,6 @@ struct BBoxFilter {
     float3 max_pt;
     bool   enabled = false;
 };
-
-// ─────────────────────────────────────────────
-//  Helper: CUDA error check
-// ─────────────────────────────────────────────
-
-#define CUDA_CHECK(call)  do { \
-    cudaError_t err = call;    \
-    if (err != cudaSuccess) {  \
-        fprintf(stderr, "CUDA error at %s:%d: %s\n", \
-            __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(1); \
-    } } while(0)
 
 inline dim3 grid1d(int n, int block = 256) {
     return dim3((n + block - 1) / block);

@@ -6,8 +6,9 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_BUILD_TYPE Release)
 
 # CUDA settings
-set(CMAKE_CUDA_ARCHITECTURES 75 86) # Turing / Ampere — adjust to your GPU
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -lineinfo")
+set(CMAKE_CUDA_ARCHITECTURES 89)
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --use_fast_math --expt-relaxed-constexpr -Xptxas=-O3")
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 find_package(CUDAToolkit REQUIRED)
 find_package(OpenCV REQUIRED)

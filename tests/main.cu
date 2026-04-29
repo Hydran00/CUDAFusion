@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <filesystem>
 #include <chrono>
+#include <limits>
 
 #include <opencv2/opencv.hpp>
 #include <cuda_runtime.h>
@@ -95,7 +96,7 @@ private:
         std::ifstream assoc(assoc_path);
         if (!assoc.is_open())
         {
-            // Fallback: scansiona cartella depth/
+            // Fallback: scansiona cartella depth/ usando la scala del config.
             load_raw_dir(cfg_.path + "/depth", ".png");
             return;
         }
@@ -144,8 +145,12 @@ private:
         load_raw_dir(cfg_.path, ext);
     }
 
-    void load_raw_dir(const std::string &dir, const std::string &ext)
+    void load_raw_dir(const std::string &dir, const std::string &ext,
+                      float depth_scale_override = -1.0f)
     {
+        const float depth_scale =
+            (depth_scale_override > 0.0f) ? depth_scale_override : cfg_.depth_scale;
+
         if (!fs::exists(dir))
         {
             std::cerr << "[DepthSequence] Directory not found: " << dir << "\n";
@@ -190,7 +195,7 @@ private:
             }
             else if (raw.type() == CV_16U)
             {
-                raw.convertTo(depth_m, CV_32F, cfg_.depth_scale);
+                raw.convertTo(depth_m, CV_32F, depth_scale);
             }
             else
             {
@@ -330,9 +335,13 @@ public:
         float node_min_dist = 0.025f;
         float dist_threshold = 0.05f; // ICP distanza max
         float angle_threshold = 0.7f; // cos(angolo) min normali
+        int min_valid_corrs = 2000;
         int max_nodes = 4096;
         int max_corrs = 300000;
+        int node_update_every_n = 5;
+        float max_dx_mean = 0.03f;
         BBoxFilter bbox;
+        bool integrate_warped = false;
         bool debug_vis = false;
         int  debug_every_n = 1;
     };
@@ -353,6 +362,7 @@ public:
         d_delta_x_.allocate(p.max_nodes * 6);
         d_hit_voxel_idx_.allocate(n_pixels);
         d_num_valid_.allocate(1);
+        d_corr_stats_.allocate(6);
 
         camera_pose_ = Mat4::identity();
     }
@@ -363,11 +373,16 @@ public:
 
         const bool do_dbg = params_.debug_vis && (frame_count_ % params_.debug_every_n == 0);
 
+        if (frame_count_ == 0)
+            print_cpu_depth_stats(depth_m, "cpu depth input");
+
         // 1. Upload depth
         {
             std::vector<float> h_depth(
                 (float *)depth_m.datastart,
                 (float *)depth_m.dataend);
+            if (frame_count_ == 0)
+                print_host_depth_stats(h_depth, "host upload vector");
             d_depth_.upload(h_depth);
         }
 
@@ -382,11 +397,17 @@ public:
             cv::waitKey(1);
         }
 
+        if (frame_count_ == 0)
+            print_depth_stats("depth before bbox");
+
         // 1b. Bounding box filter on depth (before integration)
         if (params_.bbox.enabled)
         {
             apply_depth_bbox_filter();
         }
+
+        if (frame_count_ == 0)
+            print_depth_stats("depth after bbox");
 
         // 2. Calcola normali dal depth
         compute_normals();
@@ -404,10 +425,13 @@ public:
             // Primo frame: solo integra
             volume_->integrate(d_depth_, d_depth_normals_,
                                params_.cam, camera_pose_);
+            print_tsdf_stats("tsdf after first integrate");
             initialize_node_graph();
         }
         else
         {
+            bool warp_update_ok = false;
+
             // Warp field: salva trasformazioni precedenti (warm start)
             warp_field_->save_transforms();
 
@@ -434,7 +458,7 @@ public:
                 apply_bbox_filter(d_vertices_live_);
 
             // 4. Trova corrispondenze ICP
-            int num_corrs = find_correspondences();
+            int num_corrs = find_correspondences(do_dbg);
             std::cout << "  Corrispondenze valide: " << num_corrs << "\n";
 
             if (do_dbg)
@@ -445,7 +469,7 @@ public:
                 cv::waitKey(1);
             }
 
-            if (num_corrs > 100)
+            if (num_corrs >= params_.min_valid_corrs)
             {
                 // 5. Ottimizzazione Gauss-Newton
                 // Pass full pixel array size; solver skips invalid entries via corr.valid
@@ -457,8 +481,7 @@ public:
                     warp_field_->num_nodes(),
                     d_delta_x_);
 
-                // 6. Applica incremento
-                warp_field_->apply_twist_increment(d_delta_x_);
+                // 6. Valida incremento prima di applicarlo.
                 {
                     std::vector<float> h_dx;
                     d_delta_x_.download(h_dx);
@@ -466,27 +489,55 @@ public:
                     int n6 = warp_field_->num_nodes() * 6;
                     for (int i = 0; i < n6; i++)
                         norm2 += h_dx[i] * h_dx[i];
-                    std::cout << "  [dx] ||delta_x||=" << sqrtf(norm2)
-                              << " nodes=" << warp_field_->num_nodes() << "\n";
+                    float dx_norm = sqrtf(norm2);
+                    float dx_mean = dx_norm / std::max(1, warp_field_->num_nodes());
+                    warp_update_ok = dx_mean < params_.max_dx_mean;
+                    std::cout << "  [dx] ||delta_x||=" << dx_norm
+                              << " mean/node=" << dx_mean
+                              << " nodes=" << warp_field_->num_nodes()
+                              << " max_mean=" << params_.max_dx_mean << "\n";
                     if (do_dbg)
                     {
                         cv::imshow("5_delta_x", dbg_delta_x(h_dx, warp_field_->num_nodes()));
                         cv::waitKey(1);
                     }
                 }
+                if (warp_update_ok)
+                {
+                    warp_field_->apply_twist_increment(d_delta_x_);
+                }
+                else
+                {
+                    std::cout << "  [warp] skip applying unstable update\n";
+                }
+            }
+            else
+            {
+                std::cout << "  [solve] skip warp update (too few correspondences, min="
+                          << params_.min_valid_corrs << ")\n";
             }
 
             // 7. Integra depth con warp corrente
-            volume_->integrate(
-                d_depth_, d_depth_normals_,
-                params_.cam, camera_pose_,
-                warp_field_->device_nodes(),
-                warp_field_->device_transforms(),
-                warp_field_->num_nodes(),
-                d_voxel_knn_.data, d_voxel_knn_w_.data);
+            if (warp_update_ok && params_.integrate_warped)
+            {
+                volume_->integrate(
+                    d_depth_, d_depth_normals_,
+                    params_.cam, camera_pose_,
+                    warp_field_->device_nodes(),
+                    warp_field_->device_transforms(),
+                    warp_field_->num_nodes(),
+                    d_voxel_knn_.data, d_voxel_knn_w_.data);
+            }
+            else
+            {
+                std::cout << "  [integrate] skip warped fusion"
+                          << (warp_update_ok ? " (disabled)" : " (warp update not stable)")
+                          << "\n";
+            }
 
             // 8. Aggiorna grafo con nuovi nodi
-            if (frame_count_ % 5 == 0) // ogni 5 frame
+            if (params_.node_update_every_n > 0 &&
+                frame_count_ % params_.node_update_every_n == 0)
                 update_node_graph();
         }
 
@@ -588,7 +639,8 @@ public:
                 if (best_id[k] < 0 || w_sum < 1e-8f)
                     continue;
                 float w = weights[k] / w_sum;
-                float3 tp = h_transforms[best_id[k]].transform_point(p);
+                float3 tp = h_transforms[best_id[k]].transform_point_centered(
+                    p, h_nodes[best_id[k]].pos);
                 wp.x += w * tp.x;
                 wp.y += w * tp.y;
                 wp.z += w * tp.z;
@@ -657,6 +709,7 @@ private:
     DeviceArray<int> d_pixel_knn_;
     DeviceArray<float> d_pixel_knn_w_;
     DeviceArray<int> d_num_valid_;
+    DeviceArray<int> d_corr_stats_;
     DeviceArray<int> d_hit_voxel_idx_;
 
     Mat4 camera_pose_;
@@ -754,7 +807,109 @@ private:
         cudaDeviceSynchronize();
     }
 
-    int find_correspondences()
+    void print_depth_stats(const char *label)
+    {
+        std::vector<float> h_depth;
+        d_depth_.download(h_depth);
+        int valid = 0;
+        float min_v = std::numeric_limits<float>::max();
+        float max_v = 0.0f;
+        double sum = 0.0;
+        for (float d : h_depth)
+        {
+            if (d <= 0.0f)
+                continue;
+            valid++;
+            min_v = std::min(min_v, d);
+            max_v = std::max(max_v, d);
+            sum += d;
+        }
+        std::cout << "  [" << label << "] valid=" << valid
+                  << " min=" << (valid ? min_v : 0.0f)
+                  << " max=" << (valid ? max_v : 0.0f)
+                  << " mean=" << (valid ? (sum / valid) : 0.0) << "\n";
+    }
+
+    void print_cpu_depth_stats(const cv::Mat &depth, const char *label)
+    {
+        int valid = 0;
+        float min_v = std::numeric_limits<float>::max();
+        float max_v = 0.0f;
+        double sum = 0.0;
+        for (int r = 0; r < depth.rows; r++)
+        {
+            const float *row = depth.ptr<float>(r);
+            for (int c = 0; c < depth.cols; c++)
+            {
+                float d = row[c];
+                if (d <= 0.0f)
+                    continue;
+                valid++;
+                min_v = std::min(min_v, d);
+                max_v = std::max(max_v, d);
+                sum += d;
+            }
+        }
+        std::cout << "  [" << label << "] type=" << depth.type()
+                  << " continuous=" << depth.isContinuous()
+                  << " valid=" << valid
+                  << " min=" << (valid ? min_v : 0.0f)
+                  << " max=" << (valid ? max_v : 0.0f)
+                  << " mean=" << (valid ? (sum / valid) : 0.0) << "\n";
+    }
+
+    void print_host_depth_stats(const std::vector<float> &depth, const char *label)
+    {
+        int valid = 0;
+        float min_v = std::numeric_limits<float>::max();
+        float max_v = 0.0f;
+        double sum = 0.0;
+        for (float d : depth)
+        {
+            if (d <= 0.0f)
+                continue;
+            valid++;
+            min_v = std::min(min_v, d);
+            max_v = std::max(max_v, d);
+            sum += d;
+        }
+        std::cout << "  [" << label << "] size=" << depth.size()
+                  << " valid=" << valid
+                  << " min=" << (valid ? min_v : 0.0f)
+                  << " max=" << (valid ? max_v : 0.0f)
+                  << " mean=" << (valid ? (sum / valid) : 0.0) << "\n";
+    }
+
+    void print_tsdf_stats(const char *label)
+    {
+        std::vector<TSDFVoxel> h_voxels;
+        h_voxels.resize(volume_->total_voxels());
+        cudaMemcpy(h_voxels.data(), volume_->device_data(),
+                   h_voxels.size() * sizeof(TSDFVoxel), cudaMemcpyDeviceToHost);
+
+        int observed = 0, neg = 0, near_zero = 0;
+        float min_tsdf = 1.0f;
+        float max_tsdf = -1.0f;
+        for (const auto &voxel : h_voxels)
+        {
+            if (voxel.weight <= 0.0f)
+                continue;
+            observed++;
+            min_tsdf = std::min(min_tsdf, voxel.tsdf);
+            max_tsdf = std::max(max_tsdf, voxel.tsdf);
+            if (voxel.tsdf < 0.0f)
+                neg++;
+            if (fabsf(voxel.tsdf) < 0.2f)
+                near_zero++;
+        }
+        std::cout << "  [" << label << "] observed=" << observed
+                  << " neg=" << neg
+                  << " near_zero=" << near_zero
+                  << " min=" << (observed ? min_tsdf : 0.0f)
+                  << " max=" << (observed ? max_tsdf : 0.0f) << "\n";
+    }
+
+    int find_correspondences(bool debug)
     {
         int n_pixels = params_.cam.width * params_.cam.height;
 
@@ -765,6 +920,7 @@ private:
             d_pixel_knn_w_.allocate(n_pixels * K_NEIGHBORS);
         }
         d_num_valid_.zero();
+        d_corr_stats_.zero();
 
         dim3 block(16, 16);
         dim3 grid(
@@ -787,11 +943,23 @@ private:
             params_.cam.width, params_.cam.height,
             params_.cam, T_cam_world,
             d_pixel_knn_.data, d_pixel_knn_w_.data,
-            params_.dist_threshold, params_.angle_threshold);
+            params_.dist_threshold, params_.angle_threshold,
+            debug ? d_corr_stats_.data : nullptr);
         cudaDeviceSynchronize();
 
         int h_valid = 0;
         cudaMemcpy(&h_valid, d_num_valid_.data, sizeof(int), cudaMemcpyDeviceToHost);
+        if (debug)
+        {
+            std::vector<int> h_stats;
+            d_corr_stats_.download(h_stats);
+            std::cout << "  [corr debug] invalid_live=" << h_stats[0]
+                      << " out_proj=" << h_stats[1]
+                      << " no_depth=" << h_stats[2]
+                      << " far=" << h_stats[3]
+                      << " angle=" << h_stats[4]
+                      << " valid=" << h_stats[5] << "\n";
+        }
         return h_valid;
     }
 };
@@ -849,17 +1017,27 @@ AppConfig load_config(const std::string &path)
     out.df.solver.gn_iterations = sol["gn_iterations"].as<int>();
     out.df.solver.pcg_iterations = sol["pcg_iterations"].as<int>();
     out.df.solver.lambda_smooth = sol["lambda_smooth"].as<float>();
+    if (sol["lambda_damping"])
+        out.df.solver.lambda_damping = sol["lambda_damping"].as<float>();
 
     // ───── warp ─────
     auto w = cfg["warp"];
     out.df.node_radius = w["node_radius"].as<float>();
     out.df.node_min_dist = w["node_min_dist"].as<float>();
     out.df.max_nodes = w["max_nodes"].as<int>();
+    if (w["node_update_every_n"])
+        out.df.node_update_every_n = w["node_update_every_n"].as<int>();
+    if (w["max_dx_mean"])
+        out.df.max_dx_mean = w["max_dx_mean"].as<float>();
+    if (w["integrate_warped"])
+        out.df.integrate_warped = w["integrate_warped"].as<bool>();
 
     // ───── icp ─────
     auto icp = cfg["icp"];
     out.df.dist_threshold = icp["dist_threshold"].as<float>();
     out.df.angle_threshold = icp["angle_threshold"].as<float>();
+    if (icp["min_valid_corrs"])
+        out.df.min_valid_corrs = icp["min_valid_corrs"].as<int>();
 
     // ───── bbox ─────
     auto b = cfg["bbox"];
@@ -967,6 +1145,10 @@ int main(int argc, char **argv)
         {
             app.use_vis = true;
         }
+        else if (a == "--no-vis")
+        {
+            app.use_vis = false;
+        }
         else if (a == "--debug-vis")
         {
             app.df.debug_vis = true;
@@ -974,6 +1156,10 @@ int main(int argc, char **argv)
         else if (a == "--debug-every" && i + 1 < argc)
         {
             app.df.debug_every_n = std::stoi(argv[++i]);
+        }
+        else if (a == "--max-frames" && i + 1 < argc)
+        {
+            app.seq.max_frames = std::stoi(argv[++i]);
         }
         else if (a == "tum")
         {

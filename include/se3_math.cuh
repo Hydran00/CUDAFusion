@@ -111,8 +111,8 @@ float3 warp_point(
         float w   = knn_ws[k];
         if (nid < 0 || w < 1e-8f) continue;
 
-        // Applica trasformazione del nodo al punto
-        float3 warped = transforms[nid].transform_point(p);
+        // Applica trasformazione centrata sulla posizione del nodo
+        float3 warped = transforms[nid].transform_point_centered(p, nodes[nid].pos);
 
         result.x += w * warped.x;
         result.y += w * warped.y;
@@ -126,6 +126,40 @@ float3 warp_point(
         result.z /= w_sum;
     } else {
         result = p;  // nessun nodo vicino → no deformazione
+    }
+    return result;
+}
+
+__device__ __forceinline__
+float3 warp_normal(
+    float3              n,
+    const Mat4*         transforms,
+    const int*          knn_ids,
+    const float*        knn_ws)
+{
+    float3 result = make_float3(0, 0, 0);
+    float  w_sum  = 0;
+
+    #pragma unroll
+    for (int k = 0; k < K_NEIGHBORS; k++) {
+        int   nid = knn_ids[k];
+        float w   = knn_ws[k];
+        if (nid < 0 || w < 1e-8f) continue;
+
+        float3 warped = transforms[nid].transform_normal(n);
+        result.x += w * warped.x;
+        result.y += w * warped.y;
+        result.z += w * warped.z;
+        w_sum    += w;
+    }
+
+    if (w_sum > 1e-8f) {
+        result.x /= w_sum;
+        result.y /= w_sum;
+        result.z /= w_sum;
+        result = normalize3(result);
+    } else {
+        result = n;
     }
     return result;
 }
@@ -154,6 +188,7 @@ float node_weight(float3 p, float3 node_pos, float radius) {
 __device__ __forceinline__
 void compute_jacobian_row(
     float3      warped_p,   // punto warpato
+    float3      node_pos,   // centro del nodo k
     float3      normal,     // normale ICP
     float       w_k,        // peso nodo k
     float*      J_row)      // output: 6 floats
@@ -163,7 +198,10 @@ void compute_jacobian_row(
     // = [n · (warped_p × n̂)] per la parte rotazione
     // Usando la formula: n^T [p]× = (p × n)^T
 
-    float3 cp = cross3(warped_p, normal);
+    float3 local_p = make_float3(warped_p.x - node_pos.x,
+                                 warped_p.y - node_pos.y,
+                                 warped_p.z - node_pos.z);
+    float3 cp = cross3(local_p, normal);
 
     J_row[0] = w_k * cp.x;     // ∂/∂ω_x
     J_row[1] = w_k * cp.y;     // ∂/∂ω_y
