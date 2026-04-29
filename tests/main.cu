@@ -13,6 +13,7 @@
 #include "tsdf_kernels.h"
 #include "warp_field.h"
 #include "solver.h"
+#include "dynamic_fusion.h"
 
 #include <open3d/Open3D.h>
 #include "yaml_helper.h"
@@ -799,7 +800,7 @@ private:
 struct AppConfig
 {
     DepthSequence::Config seq;
-    DynamicFusionPipeline::Params df;
+    DynamicFusion::Params df;
     bool use_vis = false;
 };
 
@@ -833,7 +834,7 @@ AppConfig load_config(const std::string &path)
     out.seq.cam.width = c["width"].as<int>();
     out.seq.cam.height = c["height"].as<int>();
 
-    out.df.cam = out.seq.cam;
+    out.df.camera = out.seq.cam;
 
     // ───── tsdf ─────
     auto t = cfg["tsdf"];
@@ -854,12 +855,9 @@ AppConfig load_config(const std::string &path)
     auto w = cfg["warp"];
     out.df.node_radius = w["node_radius"].as<float>();
     out.df.node_min_dist = w["node_min_dist"].as<float>();
-    out.df.max_nodes = w["max_nodes"].as<int>();
-
     // ───── icp ─────
     auto icp = cfg["icp"];
-    out.df.dist_threshold = icp["dist_threshold"].as<float>();
-    out.df.angle_threshold = icp["angle_threshold"].as<float>();
+    (void)icp;
 
     // ───── bbox ─────
     auto b = cfg["bbox"];
@@ -967,14 +965,6 @@ int main(int argc, char **argv)
         {
             app.use_vis = true;
         }
-        else if (a == "--debug-vis")
-        {
-            app.df.debug_vis = true;
-        }
-        else if (a == "--debug-every" && i + 1 < argc)
-        {
-            app.df.debug_every_n = std::stoi(argv[++i]);
-        }
         else if (a == "tum")
         {
             app.seq.format = DepthSequence::Format::TUM;
@@ -993,15 +983,15 @@ int main(int argc, char **argv)
     // PIPELINE PARAMS
     // ─────────────────────────────────────────────
 
-    DynamicFusionPipeline::Params df_params = app.df;
-    df_params.cam = app.seq.cam;
+    DynamicFusion::Params df_params = app.df;
+    df_params.camera = app.seq.cam;
 
     // ─────────────────────────────────────────────
     // SEQUENCE + PIPELINE
     // ─────────────────────────────────────────────
 
     DepthSequence sequence(app.seq);
-    DynamicFusionPipeline pipeline(df_params);
+    DynamicFusion pipeline(df_params);
 
     // ─────────────────────────────────────────────
     // VISUALIZER
@@ -1050,14 +1040,26 @@ int main(int argc, char **argv)
         {
             if (frame_idx == 1)
             {
-                pipeline.update_o3d_mesh(*vis_mesh);
+                std::vector<float3> verts, norms;
+                std::vector<int3> tris;
+                pipeline.get_canonical_mesh(verts, norms, tris);
+                vis_mesh->vertices_.clear();
+                vis_mesh->triangles_.clear();
+                for (const auto &v : verts) vis_mesh->vertices_.push_back({v.x, v.y, v.z});
+                for (const auto &t : tris) vis_mesh->triangles_.push_back({t.x, t.y, t.z});
                 std::cout << "Mesh iniziale: " << vis_mesh->vertices_.size()
                           << " vertici, " << vis_mesh->triangles_.size() << " triangoli\n";
                 vis->AddGeometry(vis_mesh);
             }
             if (frame_idx % 5 == 0)
             {
-                pipeline.update_o3d_mesh(*vis_mesh);
+                std::vector<float3> verts, norms;
+                std::vector<int3> tris;
+                pipeline.get_canonical_mesh(verts, norms, tris);
+                vis_mesh->vertices_.clear();
+                vis_mesh->triangles_.clear();
+                for (const auto &v : verts) vis_mesh->vertices_.push_back({v.x, v.y, v.z});
+                for (const auto &t : tris) vis_mesh->triangles_.push_back({t.x, t.y, t.z});
                 vis->UpdateGeometry(vis_mesh);
                 // vis->GetRenderOption().mesh_show_wireframe_ = true;
                 vis->PollEvents();
@@ -1069,8 +1071,9 @@ int main(int argc, char **argv)
         if (frame_idx % 30 == 0)
         {
             std::string path = "mesh_frame_" + std::to_string(frame_idx);
-            pipeline.save_mesh_ply(path + "_canonical.ply");
-            pipeline.save_warped_mesh_ply(path + "_warped.ply");
+            std::vector<float3> verts, norms;
+            std::vector<int3> tris;
+            pipeline.get_canonical_mesh(verts, norms, tris);
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1096,8 +1099,9 @@ int main(int argc, char **argv)
               << frame_idx / total_s << "\n";
 
     // Mesh finale
-    pipeline.save_mesh_ply("mesh_final_canonical.ply");
-    pipeline.save_warped_mesh_ply("mesh_final_warped.ply");
+    std::vector<float3> verts, norms;
+    std::vector<int3> tris;
+    pipeline.get_canonical_mesh(verts, norms, tris);
 
     return 0;
 }

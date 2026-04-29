@@ -12,7 +12,7 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -lineinfo")
 find_package(CUDAToolkit REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(Open3D REQUIRED HINTS /home/hydran00/Open3D/lib/cmake/Open3D)
+find_package(Open3D REQUIRED)
 include(FetchContent)
 
 FetchContent_Declare(
