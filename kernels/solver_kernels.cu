@@ -35,6 +35,8 @@ __global__ void assemble_data_term_kernel(
     float3 src    = c.src;
     float3 dst    = c.dst;
     float3 normal = c.normal;
+    float  weight = fmaxf(c.weight, 0.0f);
+    if (weight <= 1e-8f) return;
 
     // Residuo ICP punto-piano
     float residual = dot3(normal, make_float3(src.x-dst.x, src.y-dst.y, src.z-dst.z));
@@ -51,7 +53,7 @@ __global__ void assemble_data_term_kernel(
 
         // Contributo a b: J_i^T * r
         for (int a = 0; a < 6; a++)
-            atomicAdd(&b_values[ni*6 + a], -Ji[a] * residual);
+            atomicAdd(&b_values[ni*6 + a], -weight * Ji[a] * residual);
 
         // Contributo a A: J_i^T * J_j per tutti j
         for (int kj = 0; kj < K_NEIGHBORS; kj++) {
@@ -74,7 +76,7 @@ __global__ void assemble_data_term_kernel(
             float* blk = A_values + block_pos * BLOCK_SIZE;
             for (int a = 0; a < 6; a++)
                 for (int b = 0; b < 6; b++)
-                    atomicAdd(&blk[a*6 + b], Ji[a] * Jj[b]);
+                    atomicAdd(&blk[a*6 + b], weight * Ji[a] * Jj[b]);
         }
     }
 }

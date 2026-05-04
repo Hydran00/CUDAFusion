@@ -86,7 +86,10 @@ void collect_neighbors(const SpatialGrid& grid, float3 v,
 __global__ void apply_twist_kernel(
     const float* delta_x,
     Mat4*        transforms,
-    int          num_nodes)
+    int          num_nodes,
+    float        max_rot,
+    float        max_trans,
+    float        update_scale)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_nodes) return;
@@ -94,15 +97,12 @@ __global__ void apply_twist_kernel(
     float twist[6];
     #pragma unroll
     for (int k = 0; k < 6; k++)
-        twist[k] = delta_x[i * 6 + k];
-
-    const float max_rot = 0.005f;   // rad per frame
-    const float max_trans = 0.002f; // metres per frame
+        twist[k] = update_scale * delta_x[i * 6 + k];
 
     float rot_norm = sqrtf(twist[0] * twist[0] +
                            twist[1] * twist[1] +
                            twist[2] * twist[2]);
-    if (rot_norm > max_rot) {
+    if (max_rot > 0.0f && rot_norm > max_rot) {
         float s = max_rot / rot_norm;
         twist[0] *= s;
         twist[1] *= s;
@@ -112,7 +112,7 @@ __global__ void apply_twist_kernel(
     float trans_norm = sqrtf(twist[3] * twist[3] +
                              twist[4] * twist[4] +
                              twist[5] * twist[5]);
-    if (trans_norm > max_trans) {
+    if (max_trans > 0.0f && trans_norm > max_trans) {
         float s = max_trans / trans_norm;
         twist[3] *= s;
         twist[4] *= s;
@@ -367,14 +367,25 @@ void WarpField::save_transforms() {
                num_nodes_ * sizeof(Mat4), cudaMemcpyDeviceToDevice);
 }
 
-void WarpField::apply_twist_increment(const DeviceArray<float>& delta_x) {
+void WarpField::restore_transforms() {
+    cudaMemcpy(d_transforms_.data, d_transforms_prev_.data,
+               num_nodes_ * sizeof(Mat4), cudaMemcpyDeviceToDevice);
+    h_transforms_.resize(num_nodes_);
+    cudaMemcpy(h_transforms_.data(), d_transforms_.data,
+               num_nodes_ * sizeof(Mat4), cudaMemcpyDeviceToHost);
+}
+
+void WarpField::apply_twist_increment(const DeviceArray<float>& delta_x,
+                                      float max_rot, float max_trans,
+                                      float update_scale) {
     if (num_nodes_ == 0) return;
 
     int block = 256;
     int grid  = (num_nodes_ + block - 1) / block;
 
     apply_twist_kernel<<<grid, block>>>(
-        delta_x.data, d_transforms_.data, num_nodes_);
+        delta_x.data, d_transforms_.data, num_nodes_, max_rot, max_trans,
+        update_scale);
 
     cudaDeviceSynchronize();
 

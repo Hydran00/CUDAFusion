@@ -1,0 +1,3 @@
+[submodule "thirdparty/CudaSift"]
+	path = thirdparty/CudaSift
+	url = git@github.com:Celebrandil/CudaSift.git

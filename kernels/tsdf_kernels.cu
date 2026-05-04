@@ -356,6 +356,8 @@ __global__ void find_correspondences_kernel(
     const float*       pixel_knn_w,
     float              dist_threshold,
     float              angle_threshold,
+    float              view_threshold,
+    int                search_radius_px,
     int*               debug_stats)
 {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
@@ -366,6 +368,7 @@ __global__ void find_correspondences_kernel(
 
     Correspondence corr;
     corr.valid = false;
+    corr.weight = 0.0f;
 
     float3 v_live = live_vertices[px];
     float3 n_live = live_normals[px];
@@ -392,36 +395,86 @@ __global__ void find_correspondences_kernel(
             goto store;
         }
 
-        float d_dst = depth_map[pv * img_w + pu];
-        if (d_dst <= 0) {
+        float3 n_cam   = T_cam_world.transform_normal(n_live);
+        float3 best_dst = make_float3(0, 0, 0);
+        float3 best_n = make_float3(0, 0, 0);
+        float best_score = dist_threshold;
+        float best_weight = 0.0f;
+        float euclidean_cap = fmaxf(3.0f * dist_threshold, dist_threshold + 0.03f);
+        float normal_eps = fmaxf(1.0f - angle_threshold, 1e-4f);
+        float view_eps = fmaxf(1.0f - view_threshold, 1e-4f);
+        float3 view_dir = normalize3(make_float3(-v_cam.x, -v_cam.y, -v_cam.z));
+        float view_cos = fabsf(dot3(n_cam, view_dir));
+        if (view_cos < view_threshold) {
+            if (debug_stats) atomicAdd(&debug_stats[4], 1);
+            goto store;
+        }
+        bool saw_depth = false;
+        bool saw_close = false;
+        bool saw_angle = false;
+
+        // Projective ICP with a small local search. A single rounded pixel is
+        // fragile when the warp is still catching up or the depth has holes.
+        int radius = max(0, search_radius_px);
+        for (int dy = -radius; dy <= radius; dy++) {
+            int y = pv + dy;
+            if (y < 0 || y >= img_h) continue;
+            for (int dx = -radius; dx <= radius; dx++) {
+                int x = pu + dx;
+                if (x < 0 || x >= img_w) continue;
+
+                float d_dst = depth_map[y * img_w + x];
+                if (d_dst <= 0) continue;
+                saw_depth = true;
+
+                float3 v_dst = cam.unproject(x, y, d_dst);
+                float3 diff = make_float3(v_cam.x - v_dst.x,
+                               v_cam.y - v_dst.y,
+                               v_cam.z - v_dst.z);
+                float euclidean_dist = norm3(diff);
+                if (euclidean_dist > euclidean_cap) continue;
+
+                float3 n_dst = depth_normals[y * img_w + x];
+                if (norm3(n_dst) < 1e-6f) continue;
+                float cosine = fabsf(dot3(n_cam, n_dst));
+                if (cosine < angle_threshold) continue;
+                saw_angle = true;
+
+                float plane_dist = fabsf(dot3(n_dst, diff));
+                if (plane_dist > dist_threshold || plane_dist >= best_score) continue;
+                saw_close = true;
+
+                float phi_d = 1.0f - euclidean_dist / dist_threshold;
+                float phi_n = 1.0f - (1.0f - cosine) / normal_eps;
+                float phi_v = 1.0f - (1.0f - view_cos) / view_eps;
+                float confidence = (phi_d + phi_n + phi_v) / 3.0f;
+                confidence = confidence * confidence;
+
+                best_score = plane_dist;
+                best_weight = confidence;
+                best_dst = v_dst;
+                best_n = n_dst;
+            }
+        }
+
+        if (!saw_depth) {
             if (debug_stats) atomicAdd(&debug_stats[2], 1);
             goto store;
         }
-
-        float3 v_dst   = cam.unproject(pu, pv, d_dst);
-        float3 n_dst   = depth_normals[pv * img_w + pu];
-        float3 n_cam   = T_cam_world.transform_normal(n_live);
-
-        // Filtra per distanza e angolo
-        float3 diff = make_float3(v_cam.x - v_dst.x,
-                       v_cam.y - v_dst.y,
-                       v_cam.z - v_dst.z);
-        float dist = norm3(diff);
-        if (dist > dist_threshold) {
+        if (!saw_close) {
             if (debug_stats) atomicAdd(&debug_stats[3], 1);
             goto store;
         }
-
-        float cosine = dot3(n_cam, n_dst);
-        if (cosine < angle_threshold) {
+        if (!saw_angle) {
             if (debug_stats) atomicAdd(&debug_stats[4], 1);
             goto store;
         }
 
         // Salva corrispondenza
         corr.src    = v_live;
-        corr.dst    = v_dst;
-        corr.normal = n_dst;
+        corr.dst    = best_dst;
+        corr.normal = best_n;
+        corr.weight = best_weight;
         corr.valid  = true;
 
         // Copia k-NN nodi per questo pixel

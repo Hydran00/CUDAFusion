@@ -190,6 +190,7 @@ struct Correspondence {
     float3 normal;   // normale del punto dst
     int    node_ids[K_NEIGHBORS];
     float  node_ws[K_NEIGHBORS];
+    float  weight;
     bool   valid;
 };
 

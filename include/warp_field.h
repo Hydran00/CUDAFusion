@@ -63,9 +63,12 @@ class WarpField {
 
   // Salva trasformazioni correnti come "prev" (warm start)
   void save_transforms();
+  void restore_transforms();
 
   // Applica incremento twist: T_i ← exp(Δx_i) · T_i
-  void apply_twist_increment(const DeviceArray<float>& delta_x);
+  void apply_twist_increment(const DeviceArray<float>& delta_x,
+                             float max_rot, float max_trans,
+                             float update_scale = 1.0f);
 
   // Reset trasformazioni a identità
   void reset_transforms();

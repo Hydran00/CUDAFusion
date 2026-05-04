@@ -61,6 +61,8 @@ __global__ void find_correspondences_kernel(
     const float*       pixel_knn_w,
     float              dist_threshold,
     float              angle_threshold,
+    float              view_threshold,
+    int                search_radius_px,
     int*               debug_stats);
 
 __global__ void compute_pixel_knn_kernel(

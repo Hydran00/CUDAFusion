@@ -16,6 +16,11 @@ find_package(Eigen3 REQUIRED)
 find_package(Open3D REQUIRED HINTS /home/hydran00/Open3D/lib/cmake/Open3D)
 include(FetchContent)
 
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(VERBOSE_OUTPUT OFF CACHE BOOL "" FORCE)
+add_subdirectory(thirdparty/CudaSift)
+
 FetchContent_Declare(
   yaml-cpp
   GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
@@ -26,6 +31,7 @@ FetchContent_MakeAvailable(yaml-cpp)
 
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/thirdparty/CudaSift
     ${OpenCV_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
     ${CUDAToolkit_INCLUDE_DIRS}
@@ -47,6 +53,7 @@ target_link_libraries(dfusion
 add_executable(run_fusion tests/main.cu)
 set_target_properties(run_fusion PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(run_fusion dfusion Open3D::Open3D)
+target_link_libraries(run_fusion cudasift_lib)
 
 # Test loader
 # add_executable(test_tsdf tests/test_tsdf.cpp)

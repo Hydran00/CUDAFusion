@@ -1,5 +1,6 @@
 sequence:
-  path: "/media/nardi/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/Umbrella"
+  path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/Umbrella"
+  # path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/boxing"
   format: "tum"   # tum | icl | raw
   depth_scale: 0.001
   start_frame: 0
@@ -20,23 +21,41 @@ tsdf:
   origin: [-0.768, -0.768, 0.05]
 
 solver:
-  gn_iterations: 1
-  pcg_iterations: 30
-  lambda_smooth: 200.0
-  lambda_damping: 0.05
+  gn_iterations: 2
+  pcg_iterations: 40
+  lambda_smooth: 150.0
+  lambda_damping: 2.0
 
 warp:
   node_radius: 0.08
   node_min_dist: 0.04
   max_nodes: 4096
   node_update_every_n: 0
-  max_dx_mean: 0.03
-  integrate_warped: false
+  max_dx_mean: 0.05
+  max_update_rot: 0.01
+  max_update_trans: 0.005
+  update_scale: 0.15
+  integrate_warped: false # todo remove 
+  integrate_unwarped_fallback: false
 
 icp:
-  dist_threshold: 0.025
-  angle_threshold: 0.85
-  min_valid_corrs: 10000
+  dist_threshold: 0.04
+  angle_threshold: 0.9
+  view_threshold: 0.2
+  search_radius_px: 16
+  min_valid_corrs: 2000
+
+sift:
+  enabled: true
+  max_features: 8192
+  max_history: 8
+  max_matches_per_frame: 48
+  octaves: 5
+  threshold: 3.0
+  max_match_error: 5.0
+  max_ambiguity: 0.85
+  max_3d_dist: 0.08
+  weight: 0.25
 
 bbox:
   enabled: true
