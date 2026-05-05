@@ -15,35 +15,37 @@ camera:
   height: 480
 
 tsdf:
-  dims: [256, 256, 256]
-  voxel_size: 0.006
-  truncation: 0.03
+  dims: [192, 192, 192]
+  voxel_size: 0.008
+  truncation: 0.04
   origin: [-0.768, -0.768, 0.05]
 
 solver:
-  gn_iterations: 2
-  pcg_iterations: 40
-  lambda_smooth: 150.0
-  lambda_damping: 2.0
+  gn_iterations: 1
+  pcg_iterations: 24
+  lambda_smooth: 250.0
+  lambda_damping: 5.0
 
 warp:
-  node_radius: 0.08
-  node_min_dist: 0.04
-  max_nodes: 4096
-  node_update_every_n: 0
-  max_dx_mean: 0.05
-  max_update_rot: 0.01
-  max_update_trans: 0.005
-  update_scale: 0.15
-  integrate_warped: false # todo remove 
+  node_radius: 0.10
+  node_min_dist: 0.06
+  max_nodes: 1024
+  node_update_every_n: 10
+  max_dx_mean: 0.03
+  max_update_rot: 0.02
+  max_update_trans: 0.01
+  update_scale: 0.10
+  integrate_warped: true
+  integrate_min_optimized_count: 3
   integrate_unwarped_fallback: false
 
 icp:
-  dist_threshold: 0.04
-  angle_threshold: 0.9
+  rigid_tracking: true
+  dist_threshold: 0.06
+  angle_threshold: 0.75
   view_threshold: 0.2
-  search_radius_px: 16
-  min_valid_corrs: 2000
+  search_radius_px: 8
+  min_valid_corrs: 500
 
 sift:
   enabled: true
@@ -60,7 +62,7 @@ sift:
 bbox:
   enabled: true
   min_pt: [-1.0, -1.0, 0.01]
-  max_pt: [1.0, 1.0, 2.0]
+  max_pt: [1.0, 1.0, 1.8]
 
 visualizer:
   enabled: true

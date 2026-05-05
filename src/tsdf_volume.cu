@@ -24,7 +24,9 @@ void TSDFVolume::integrate(const DeviceArray<float>& depth,
                            const CameraIntrinsics& cam, const Mat4& camera_pose,
                            const DeformNode* nodes, const Mat4* transforms,
                            int num_nodes, const int* voxel_knn,
-                           const float* voxel_knn_w) {
+                           const float* voxel_knn_w,
+                           const int* voxel_opt_counts,
+                           int min_opt_count) {
   bool use_warp = (nodes != nullptr && num_nodes > 0);
 
   // T_cam_world = inversa di camera_pose (world→camera)
@@ -52,7 +54,8 @@ void TSDFVolume::integrate(const DeviceArray<float>& depth,
   tsdf_integrate_kernel<<<grid, block>>>(
       d_voxels_.data, params_.dims, params_.origin, params_.voxel_size,
       params_.truncation, depth.data, cam.width, cam.height, cam, T_cam_world,
-      nodes, transforms, num_nodes, voxel_knn, voxel_knn_w, use_warp);
+      nodes, transforms, num_nodes, voxel_knn, voxel_knn_w, voxel_opt_counts,
+      min_opt_count, use_warp);
 
   cudaDeviceSynchronize();
 }

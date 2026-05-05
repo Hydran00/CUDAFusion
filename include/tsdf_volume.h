@@ -32,7 +32,9 @@ public:
         const Mat4 *transforms = nullptr,
         int num_nodes = 0,
         const int *voxel_knn = nullptr,      // [vol_size * K]
-        const float *voxel_knn_w = nullptr); // [vol_size * K]
+        const float *voxel_knn_w = nullptr,  // [vol_size * K]
+        const int *voxel_opt_counts = nullptr,
+        int min_opt_count = 0);
 
     // Raycasting → mappa di vertici e normali (live frame)
     void raycast(

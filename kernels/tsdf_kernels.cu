@@ -98,6 +98,8 @@ __global__ void tsdf_integrate_kernel(
     int                  num_nodes,
     const int*           voxel_knn,
     const float*         voxel_knn_w,
+    const int*           voxel_opt_counts,
+    int                  min_opt_count,
     bool                 use_warp)
 {
     int vx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -107,6 +109,10 @@ __global__ void tsdf_integrate_kernel(
     if (vx >= dims.x || vy >= dims.y || vz >= dims.z) return;
 
     int voxel_idx = vz * dims.x * dims.y + vy * dims.x + vx;
+
+    if (use_warp && voxel_opt_counts &&
+        voxel_opt_counts[voxel_idx] < min_opt_count)
+        return;
 
     // Posizione mondo del voxel
     float3 p_world = make_float3(
@@ -351,6 +357,7 @@ __global__ void find_correspondences_kernel(
     int                img_h,
     CameraIntrinsics   cam,
     Mat4               T_cam_world,
+    Mat4               T_world_cam,
     // k-NN per ogni pixel live
     const int*         pixel_knn,       // [H*W*K] — nodi per pixel
     const float*       pixel_knn_w,
@@ -444,9 +451,9 @@ __global__ void find_correspondences_kernel(
                 if (plane_dist > dist_threshold || plane_dist >= best_score) continue;
                 saw_close = true;
 
-                float phi_d = 1.0f - euclidean_dist / dist_threshold;
-                float phi_n = 1.0f - (1.0f - cosine) / normal_eps;
-                float phi_v = 1.0f - (1.0f - view_cos) / view_eps;
+                float phi_d = fmaxf(0.0f, 1.0f - euclidean_dist / euclidean_cap);
+                float phi_n = fmaxf(0.0f, 1.0f - (1.0f - cosine) / normal_eps);
+                float phi_v = fmaxf(0.0f, 1.0f - (1.0f - view_cos) / view_eps);
                 float confidence = (phi_d + phi_n + phi_v) / 3.0f;
                 confidence = confidence * confidence;
 
@@ -472,8 +479,8 @@ __global__ void find_correspondences_kernel(
 
         // Salva corrispondenza
         corr.src    = v_live;
-        corr.dst    = best_dst;
-        corr.normal = best_n;
+        corr.dst    = T_world_cam.transform_point(best_dst);
+        corr.normal = normalize3(T_world_cam.transform_normal(best_n));
         corr.weight = best_weight;
         corr.valid  = true;
 
@@ -526,6 +533,44 @@ __global__ void compute_pixel_knn_kernel(
     for (int k = 0; k < K_NEIGHBORS; k++) {
         pixel_knn  [px * K_NEIGHBORS + k] = voxel_knn  [vidx * K_NEIGHBORS + k];
         pixel_knn_w[px * K_NEIGHBORS + k] = voxel_knn_w[vidx * K_NEIGHBORS + k];
+    }
+}
+
+__global__ void mark_optimized_voxels_kernel(
+    const Correspondence* corrs,
+    const int*            canonical_vidx,
+    int                   n_pixels,
+    int3                  dims,
+    int                   frame_id,
+    int*                  voxel_opt_counts,
+    int*                  voxel_opt_frame)
+{
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    if (px >= n_pixels) return;
+    if (!corrs[px].valid || corrs[px].weight <= 0.0f) return;
+
+    int vidx = canonical_vidx[px];
+    if (vidx < 0) return;
+
+    int vx = vidx % dims.x;
+    int vy = (vidx / dims.x) % dims.y;
+    int vz = vidx / (dims.x * dims.y);
+
+    for (int dz = -1; dz <= 1; dz++) {
+        int z = vz + dz;
+        if (z < 0 || z >= dims.z) continue;
+        for (int dy = -1; dy <= 1; dy++) {
+            int y = vy + dy;
+            if (y < 0 || y >= dims.y) continue;
+            for (int dx = -1; dx <= 1; dx++) {
+                int x = vx + dx;
+                if (x < 0 || x >= dims.x) continue;
+                int nidx = z * dims.x * dims.y + y * dims.x + x;
+                int prev = atomicExch(&voxel_opt_frame[nidx], frame_id);
+                if (prev != frame_id)
+                    atomicAdd(&voxel_opt_counts[nidx], 1);
+            }
+        }
     }
 }
 
