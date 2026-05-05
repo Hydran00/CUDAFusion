@@ -48,14 +48,11 @@ static Mat4 inverse_rigid_host(const Mat4 &pose) {
   Mat4 inv;
   for (int i = 0; i < 3; i++)
     for (int j = 0; j < 3; j++) inv.m[i][j] = pose.m[j][i];
-  inv.m[0][3] = -(inv.m[0][0] * pose.m[0][3] +
-                  inv.m[0][1] * pose.m[1][3] +
+  inv.m[0][3] = -(inv.m[0][0] * pose.m[0][3] + inv.m[0][1] * pose.m[1][3] +
                   inv.m[0][2] * pose.m[2][3]);
-  inv.m[1][3] = -(inv.m[1][0] * pose.m[0][3] +
-                  inv.m[1][1] * pose.m[1][3] +
+  inv.m[1][3] = -(inv.m[1][0] * pose.m[0][3] + inv.m[1][1] * pose.m[1][3] +
                   inv.m[1][2] * pose.m[2][3]);
-  inv.m[2][3] = -(inv.m[2][0] * pose.m[0][3] +
-                  inv.m[2][1] * pose.m[1][3] +
+  inv.m[2][3] = -(inv.m[2][0] * pose.m[0][3] + inv.m[2][1] * pose.m[1][3] +
                   inv.m[2][2] * pose.m[2][3]);
   inv.m[3][0] = inv.m[3][1] = inv.m[3][2] = 0.0f;
   inv.m[3][3] = 1.0f;
@@ -507,15 +504,15 @@ class DynamicFusionPipeline {
       d_depth_.upload(h_depth);
     }
 
-    if (do_dbg) {
-      std::vector<float> h_d;
-      d_depth_.download(h_d);
-      cv::Mat vis = dbg_depth(h_d, params_.cam.width, params_.cam.height);
-      cv::putText(vis, "frame " + std::to_string(frame_count_), {8, 18},
-                  cv::FONT_HERSHEY_SIMPLEX, 0.45, {220, 220, 220}, 1);
-      cv::imshow("1_depth_raw", vis);
-      cv::waitKey(1);
-    }
+    // if (do_dbg) {
+    //   std::vector<float> h_d;
+    //   d_depth_.download(h_d);
+    //   cv::Mat vis = dbg_depth(h_d, params_.cam.width, params_.cam.height);
+    //   cv::putText(vis, "frame " + std::to_string(frame_count_), {8, 18},
+    //               cv::FONT_HERSHEY_SIMPLEX, 0.45, {220, 220, 220}, 1);
+    //   cv::imshow("1_depth_raw", vis);
+    //   cv::waitKey(1);
+    // }
 
     if (frame_count_ == 0) print_depth_stats("depth before bbox");
 
@@ -562,9 +559,9 @@ class DynamicFusionPipeline {
         if (do_dbg && gn == 0) {
           std::vector<float3> h_v;
           d_vertices_live_.download(h_v);
-          cv::imshow("3_live_surface",
-                     dbg_verts(h_v, params_.cam,
-                               inverse_rigid_host(camera_pose_)));
+          cv::imshow(
+              "3_live_surface",
+              dbg_verts(h_v, params_.cam, inverse_rigid_host(camera_pose_)));
           cv::waitKey(1);
         }
 
@@ -594,7 +591,7 @@ class DynamicFusionPipeline {
           std::cout << "  [GN " << gn
                     << "] reject previous update (rmse increased from "
                     << last_rmse << " to " << rmse << ")\n";
-          break;
+          // break;
         }
         last_rmse = rmse;
 
@@ -624,44 +621,64 @@ class DynamicFusionPipeline {
         {
           std::vector<float> h_dx;
           d_delta_x_.download(h_dx);
+
           float rot_sum = 0.0f, trans_sum = 0.0f;
           float rot_max = 0.0f, trans_max = 0.0f;
-          int n_nodes = warp_field_->num_nodes();
-          for (int i = 0; i < n_nodes; i++) {
-            float *dx = h_dx.data() + i * 6;
-            float rn = std::sqrt(dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]);
-            float tn = std::sqrt(dx[3] * dx[3] + dx[4] * dx[4] + dx[5] * dx[5]);
-            rot_sum += rn;
-            trans_sum += tn;
-            rot_max = std::max(rot_max, rn);
-            trans_max = std::max(trans_max, tn);
-          }
-          float rot_mean = rot_sum / std::max(1, n_nodes);
-          float trans_mean = trans_sum / std::max(1, n_nodes);
+
           float eff_rot_sum = 0.0f, eff_trans_sum = 0.0f;
           float eff_rot_max = 0.0f, eff_trans_max = 0.0f;
+
+          int n_nodes = warp_field_->num_nodes();
+
           for (int i = 0; i < n_nodes; i++) {
             float *dx = h_dx.data() + i * 6;
+
             float rn = std::sqrt(dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]);
             float tn = std::sqrt(dx[3] * dx[3] + dx[4] * dx[4] + dx[5] * dx[5]);
+
+            rot_sum += rn;
+            trans_sum += tn;
+
+            rot_max = std::max(rot_max, rn);
+            trans_max = std::max(trans_max, tn);
+
+            // ---- clamp + scaling (VALORI REALI USATI) ----
             float er = params_.update_scale * rn;
             float et = params_.update_scale * tn;
+
             if (params_.max_update_rot > 0.0f)
               er = std::min(er, params_.max_update_rot);
+
             if (params_.max_update_trans > 0.0f)
               et = std::min(et, params_.max_update_trans);
+
             eff_rot_sum += er;
             eff_trans_sum += et;
+
             eff_rot_max = std::max(eff_rot_max, er);
             eff_trans_max = std::max(eff_trans_max, et);
           }
+
+          float rot_mean = rot_sum / std::max(1, n_nodes);
+          float trans_mean = trans_sum / std::max(1, n_nodes);
+
           float eff_rot_mean = eff_rot_sum / std::max(1, n_nodes);
           float eff_trans_mean = eff_trans_sum / std::max(1, n_nodes);
-          const float reject_rot = 100.0f * params_.max_update_rot;
-          const float reject_trans = 100.0f * params_.max_update_trans;
-          iter_ok = std::isfinite(rot_mean) && std::isfinite(trans_mean) &&
-                    std::isfinite(rot_max) && std::isfinite(trans_max) &&
-                    rot_max < reject_rot && trans_max < reject_trans;
+
+          // ---- reject MOLTO più sensato ----
+          const float reject_rot = 5.0f * params_.max_update_rot;
+          const float reject_trans = 5.0f * params_.max_update_trans;
+
+          // ---- controllo outlier nodi (instabilità numerica) ----
+          bool has_bad_spike =
+              (rot_max > 10.0f * rot_mean) || (trans_max > 10.0f * trans_mean);
+
+          iter_ok =
+              std::isfinite(eff_rot_mean) && std::isfinite(eff_trans_mean) &&
+              std::isfinite(eff_rot_max) && std::isfinite(eff_trans_max) &&
+              (eff_rot_max < reject_rot) && (eff_trans_max < reject_trans) &&
+              !has_bad_spike;
+
           {
             std::ostringstream ss;
             ss << std::fixed << std::setprecision(5)
@@ -671,35 +688,37 @@ class DynamicFusionPipeline {
                << " eff_rot_max=" << eff_rot_max
                << " eff_trans_mean=" << eff_trans_mean
                << " eff_trans_max=" << eff_trans_max
+               << " spike=" << (has_bad_spike ? "yes" : "no")
                << " nodes=" << n_nodes << " max_rot=" << params_.max_update_rot
                << " max_trans=" << params_.max_update_trans
                << " reject_rot=" << reject_rot
-               << " reject_trans=" << reject_trans
-               << " clamp=" << ((rot_max > params_.max_update_rot ||
-                                  trans_max > params_.max_update_trans)
-                                     ? "yes"
-                                     : "no");
+               << " reject_trans=" << reject_trans;
+
             std::cout << ss.str() << "\n";
           }
+
           if (do_dbg && gn == 0) {
             cv::imshow("5_delta_x",
                        dbg_delta_x(h_dx, warp_field_->num_nodes()));
             cv::waitKey(1);
           }
         }
+
+        // ---- APPLY SOLO SE OK ----
         if (iter_ok) {
           warp_field_->save_transforms();
+
           warp_field_->apply_twist_increment(d_delta_x_, params_.max_update_rot,
                                              params_.max_update_trans,
                                              params_.update_scale);
+
           warp_update_ok = true;
           accepted_updates++;
         } else {
-          std::cout << "  [warp] skip applying exploding/non-finite update\n";
+          std::cout << "  [warp] skip applying unstable / invalid update\n";
           break;
         }
       }
-
       // 7. Integra depth. Unwarped fusion after frame 0 is only safe for a
       // static scene/camera; otherwise it smears incompatible live frames into
       // the canonical TSDF.
@@ -752,8 +771,8 @@ class DynamicFusionPipeline {
     float mean_disp = 0.0f, max_disp = 0.0f;
     extract_warped_surface(verts, norms, tris, &mean_disp, &max_disp);
     std::cout << "warped verts: " << verts.size() << " tris: " << tris.size()
-              << " | warp_disp mean=" << mean_disp
-              << " max=" << max_disp << std::endl;
+              << " | warp_disp mean=" << mean_disp << " max=" << max_disp
+              << std::endl;
 
     mesh.vertices_.clear();
     mesh.triangles_.clear();
@@ -965,8 +984,7 @@ class DynamicFusionPipeline {
         best_id[k] = -1;
       }
       for (int ni = 0; ni < num_nodes; ni++) {
-        float3 d = make_float3(p.x - h_nodes[ni].pos.x,
-                               p.y - h_nodes[ni].pos.y,
+        float3 d = make_float3(p.x - h_nodes[ni].pos.x, p.y - h_nodes[ni].pos.y,
                                p.z - h_nodes[ni].pos.z);
         float d2 = host_dot3(d, d);
         if (d2 < best_d2[K_NEIGHBORS - 1]) {
@@ -1118,18 +1136,20 @@ class DynamicFusionPipeline {
       float area = edge(p[0], p[1], p[2]);
       if (std::fabs(area) < 1e-6f) continue;
 
-      int min_u = std::max(0, (int)std::floor(std::min({p[0].x, p[1].x, p[2].x})));
+      int min_u =
+          std::max(0, (int)std::floor(std::min({p[0].x, p[1].x, p[2].x})));
       int max_u = std::min(params_.cam.width - 1,
                            (int)std::ceil(std::max({p[0].x, p[1].x, p[2].x})));
-      int min_v = std::max(0, (int)std::floor(std::min({p[0].y, p[1].y, p[2].y})));
+      int min_v =
+          std::max(0, (int)std::floor(std::min({p[0].y, p[1].y, p[2].y})));
       int max_v = std::min(params_.cam.height - 1,
                            (int)std::ceil(std::max({p[0].y, p[1].y, p[2].y})));
       if (min_u > max_u || min_v > max_v) continue;
 
-      float3 e1 = make_float3(wc[1].x - wc[0].x, wc[1].y - wc[0].y,
-                              wc[1].z - wc[0].z);
-      float3 e2 = make_float3(wc[2].x - wc[0].x, wc[2].y - wc[0].y,
-                              wc[2].z - wc[0].z);
+      float3 e1 =
+          make_float3(wc[1].x - wc[0].x, wc[1].y - wc[0].y, wc[1].z - wc[0].z);
+      float3 e2 =
+          make_float3(wc[2].x - wc[0].x, wc[2].y - wc[0].y, wc[2].z - wc[0].z);
       float3 face_n = host_normalize3(host_cross3(e1, e2));
       if (host_norm3(face_n) < 1e-6f) continue;
 
@@ -1148,10 +1168,12 @@ class DynamicFusionPipeline {
                                   w0 * wc[0].y + w1 * wc[1].y + w2 * wc[2].y,
                                   w0 * wc[0].z + w1 * wc[1].z + w2 * wc[2].z);
           out_n[px] = face_n;
-          float3 cp = make_float3(
-              w0 * verts[ids[0]].x + w1 * verts[ids[1]].x + w2 * verts[ids[2]].x,
-              w0 * verts[ids[0]].y + w1 * verts[ids[1]].y + w2 * verts[ids[2]].y,
-              w0 * verts[ids[0]].z + w1 * verts[ids[1]].z + w2 * verts[ids[2]].z);
+          float3 cp = make_float3(w0 * verts[ids[0]].x + w1 * verts[ids[1]].x +
+                                      w2 * verts[ids[2]].x,
+                                  w0 * verts[ids[0]].y + w1 * verts[ids[1]].y +
+                                      w2 * verts[ids[2]].y,
+                                  w0 * verts[ids[0]].z + w1 * verts[ids[1]].z +
+                                      w2 * verts[ids[2]].z);
           out_vidx[px] = canonical_voxel_index(cp);
         }
       }
@@ -1352,8 +1374,7 @@ class DynamicFusionPipeline {
     Correspondence corr{};
     corr.src = warped_src;
     corr.dst = camera_pose_.transform_point(dst);
-    float3 n_cam = make_float3(axis == 0 ? 1.0f : 0.0f,
-                               axis == 1 ? 1.0f : 0.0f,
+    float3 n_cam = make_float3(axis == 0 ? 1.0f : 0.0f, axis == 1 ? 1.0f : 0.0f,
                                axis == 2 ? 1.0f : 0.0f);
     corr.normal = host_normalize3(camera_pose_.transform_normal(n_cam));
     corr.weight = params_.sift_weight;
@@ -1445,9 +1466,9 @@ class DynamicFusionPipeline {
                                             h_nodes, h_transforms);
         float3 dst_world = camera_pose_.transform_point(dst);
 
-        float3 diff = make_float3(warped_src.x - dst_world.x,
-                                  warped_src.y - dst_world.y,
-                                  warped_src.z - dst_world.z);
+        float3 diff =
+            make_float3(warped_src.x - dst_world.x, warped_src.y - dst_world.y,
+                        warped_src.z - dst_world.z);
         if (host_norm3(diff) > params_.sift_max_3d_dist) continue;
 
         append_idx = add_sparse_axis_constraint(h_corrs, append_idx, src_feat,
@@ -1482,14 +1503,15 @@ class DynamicFusionPipeline {
     double wsum = 0.0;
     for (const auto &c : h_corrs) {
       if (!c.valid || c.weight <= 0.0f) continue;
-      float3 diff = make_float3(c.src.x - c.dst.x, c.src.y - c.dst.y,
-                                c.src.z - c.dst.z);
-      double r = c.normal.x * diff.x + c.normal.y * diff.y +
-                 c.normal.z * diff.z;
+      float3 diff =
+          make_float3(c.src.x - c.dst.x, c.src.y - c.dst.y, c.src.z - c.dst.z);
+      double r =
+          c.normal.x * diff.x + c.normal.y * diff.y + c.normal.z * diff.z;
       sum += (double)c.weight * r * r;
       wsum += c.weight;
     }
-    return (wsum > 0.0) ? std::sqrt(sum / wsum) : std::numeric_limits<double>::infinity();
+    return (wsum > 0.0) ? std::sqrt(sum / wsum)
+                        : std::numeric_limits<double>::infinity();
   }
 
   static bool solve_6x6(double A[6][6], double b[6], double x[6]) {
@@ -1595,9 +1617,8 @@ class DynamicFusionPipeline {
         d_vertices_live_.data, d_normals_live_.data, d_depth_.data,
         d_depth_normals_.data, d_corrs_.data, d_num_valid_.data,
         params_.cam.width, params_.cam.height, params_.cam, T_cam_world,
-        camera_pose_,
-        d_pixel_knn_.data, d_pixel_knn_w_.data, params_.dist_threshold,
-        params_.angle_threshold, params_.view_threshold,
+        camera_pose_, d_pixel_knn_.data, d_pixel_knn_w_.data,
+        params_.dist_threshold, params_.angle_threshold, params_.view_threshold,
         params_.search_radius_px, debug ? d_corr_stats_.data : nullptr);
     cudaDeviceSynchronize();
 
@@ -1685,8 +1706,7 @@ AppConfig load_config(const std::string &path) {
     out.df.max_update_rot = w["max_update_rot"].as<float>();
   if (w["max_update_trans"])
     out.df.max_update_trans = w["max_update_trans"].as<float>();
-  if (w["update_scale"])
-    out.df.update_scale = w["update_scale"].as<float>();
+  if (w["update_scale"]) out.df.update_scale = w["update_scale"].as<float>();
   if (w["integrate_warped"])
     out.df.integrate_warped = w["integrate_warped"].as<bool>();
   if (w["integrate_unwarped_fallback"])

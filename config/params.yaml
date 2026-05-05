@@ -1,5 +1,5 @@
 sequence:
-  path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/Umbrella"
+  path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/upperbody"
   # path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/boxing"
   format: "tum"   # tum | icl | raw
   depth_scale: 0.001
@@ -21,9 +21,9 @@ tsdf:
   origin: [-0.768, -0.768, 0.05]
 
 solver:
-  gn_iterations: 1
+  gn_iterations: 30
   pcg_iterations: 24
-  lambda_smooth: 250.0
+  lambda_smooth: 10.0
   lambda_damping: 5.0
 
 warp:
@@ -48,7 +48,7 @@ icp:
   min_valid_corrs: 500
 
 sift:
-  enabled: true
+  enabled: false
   max_features: 8192
   max_history: 8
   max_matches_per_frame: 48
