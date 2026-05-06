@@ -3,77 +3,78 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-namespace {
-
-__device__ __forceinline__
-int voxel_index(int x, int y, int z, int3 dims)
+namespace
 {
-    return z * dims.x * dims.y + y * dims.x + x;
-}
 
-__device__ __forceinline__
-bool sample_tsdf_trilinear(
-    const TSDFVoxel* voxels,
-    int3             dims,
-    float3           origin,
-    float            voxel_size,
-    float3           p_world,
-    float&           tsdf,
-    int&             base_vidx)
-{
-    float gx = (p_world.x - origin.x) / voxel_size;
-    float gy = (p_world.y - origin.y) / voxel_size;
-    float gz = (p_world.z - origin.z) / voxel_size;
-
-    int x0 = __float2int_rd(gx);
-    int y0 = __float2int_rd(gy);
-    int z0 = __float2int_rd(gz);
-
-    if (x0 < 0 || x0 >= dims.x - 1 ||
-        y0 < 0 || y0 >= dims.y - 1 ||
-        z0 < 0 || z0 >= dims.z - 1)
-        return false;
-
-    float fx = gx - x0;
-    float fy = gy - y0;
-    float fz = gz - z0;
-
-    float accum = 0.0f;
-    #pragma unroll
-    for (int dz = 0; dz <= 1; dz++) {
-        float wz = dz ? fz : (1.0f - fz);
-        #pragma unroll
-        for (int dy = 0; dy <= 1; dy++) {
-            float wy = dy ? fy : (1.0f - fy);
-            #pragma unroll
-            for (int dx = 0; dx <= 1; dx++) {
-                float wx = dx ? fx : (1.0f - fx);
-                int idx = voxel_index(x0 + dx, y0 + dy, z0 + dz, dims);
-                if (voxels[idx].weight <= 0.0f)
-                    return false;
-                accum += wx * wy * wz * voxels[idx].tsdf;
-            }
-        }
+    __device__ __forceinline__ int voxel_index(int x, int y, int z, int3 dims)
+    {
+        return z * dims.x * dims.y + y * dims.x + x;
     }
 
-    tsdf = accum;
-    base_vidx = voxel_index(x0, y0, z0, dims);
-    return true;
-}
+    __device__ __forceinline__ bool sample_tsdf_trilinear(
+        const TSDFVoxel *voxels,
+        int3 dims,
+        float3 origin,
+        float voxel_size,
+        float3 p_world,
+        float &tsdf,
+        int &base_vidx)
+    {
+        float gx = (p_world.x - origin.x) / voxel_size;
+        float gy = (p_world.y - origin.y) / voxel_size;
+        float gz = (p_world.z - origin.z) / voxel_size;
 
-__device__ __forceinline__
-bool sample_tsdf_value(
-    const TSDFVoxel* voxels,
-    int3             dims,
-    float3           origin,
-    float            voxel_size,
-    float3           p_world,
-    float&           tsdf)
-{
-    int unused = -1;
-    return sample_tsdf_trilinear(voxels, dims, origin, voxel_size,
-                                 p_world, tsdf, unused);
-}
+        int x0 = __float2int_rd(gx);
+        int y0 = __float2int_rd(gy);
+        int z0 = __float2int_rd(gz);
+
+        if (x0 < 0 || x0 >= dims.x - 1 ||
+            y0 < 0 || y0 >= dims.y - 1 ||
+            z0 < 0 || z0 >= dims.z - 1)
+            return false;
+
+        float fx = gx - x0;
+        float fy = gy - y0;
+        float fz = gz - z0;
+
+        float accum = 0.0f;
+#pragma unroll
+        for (int dz = 0; dz <= 1; dz++)
+        {
+            float wz = dz ? fz : (1.0f - fz);
+#pragma unroll
+            for (int dy = 0; dy <= 1; dy++)
+            {
+                float wy = dy ? fy : (1.0f - fy);
+#pragma unroll
+                for (int dx = 0; dx <= 1; dx++)
+                {
+                    float wx = dx ? fx : (1.0f - fx);
+                    int idx = voxel_index(x0 + dx, y0 + dy, z0 + dz, dims);
+                    if (voxels[idx].weight <= 0.0f)
+                        return false;
+                    accum += wx * wy * wz * voxels[idx].tsdf;
+                }
+            }
+        }
+
+        tsdf = accum;
+        base_vidx = voxel_index(x0, y0, z0, dims);
+        return true;
+    }
+
+    __device__ __forceinline__ bool sample_tsdf_value(
+        const TSDFVoxel *voxels,
+        int3 dims,
+        float3 origin,
+        float voxel_size,
+        float3 p_world,
+        float &tsdf)
+    {
+        int unused = -1;
+        return sample_tsdf_trilinear(voxels, dims, origin, voxel_size,
+                                     p_world, tsdf, unused);
+    }
 
 } // namespace
 
@@ -82,31 +83,32 @@ bool sample_tsdf_value(
 // ─────────────────────────────────────────────
 
 __global__ void tsdf_integrate_kernel(
-    TSDFVoxel*           voxels,
-    int3                 dims,
-    float3               origin,
-    float                voxel_size,
-    float                truncation,
-    const float*         depth,
-    int                  img_w,
-    int                  img_h,
-    CameraIntrinsics     cam,
-    Mat4                 T_cam_world,    // world → camera
+    TSDFVoxel *voxels,
+    int3 dims,
+    float3 origin,
+    float voxel_size,
+    float truncation,
+    const float *depth,
+    int img_w,
+    int img_h,
+    CameraIntrinsics cam,
+    Mat4 T_cam_world, // world → camera
     // Warp field (opzionale)
-    const DeformNode*    nodes,
-    const Mat4*          transforms,
-    int                  num_nodes,
-    const int*           voxel_knn,
-    const float*         voxel_knn_w,
-    const int*           voxel_opt_counts,
-    int                  min_opt_count,
-    bool                 use_warp)
+    const DeformNode *nodes,
+    const DualQuat *transforms,
+    int num_nodes,
+    const int *voxel_knn,
+    const float *voxel_knn_w,
+    const int *voxel_opt_counts,
+    int min_opt_count,
+    bool use_warp)
 {
     int vx = blockIdx.x * blockDim.x + threadIdx.x;
     int vy = blockIdx.y * blockDim.y + threadIdx.y;
     int vz = blockIdx.z;
 
-    if (vx >= dims.x || vy >= dims.y || vz >= dims.z) return;
+    if (vx >= dims.x || vy >= dims.y || vz >= dims.z)
+        return;
 
     int voxel_idx = vz * dims.x * dims.y + vy * dims.x + vx;
 
@@ -122,39 +124,44 @@ __global__ void tsdf_integrate_kernel(
 
     // Se c'è il warp field, deforma il punto prima di proiettare
     float3 p_live = p_world;
-    if (use_warp && num_nodes > 0) {
-        const int*   knn   = voxel_knn   + voxel_idx * K_NEIGHBORS;
-        const float* knn_w = voxel_knn_w + voxel_idx * K_NEIGHBORS;
+    if (use_warp && num_nodes > 0)
+    {
+        const int *knn = voxel_knn + voxel_idx * K_NEIGHBORS;
+        const float *knn_w = voxel_knn_w + voxel_idx * K_NEIGHBORS;
         p_live = warp_point(p_world, nodes, transforms, knn, knn_w);
     }
 
     // Proietta nel frame camera
     float3 p_cam = T_cam_world.transform_point(p_live);
-    if (p_cam.z <= 0) return;
+    if (p_cam.z <= 0)
+        return;
 
     float2 px = cam.project(p_cam);
     int u = __float2int_rn(px.x);
     int v = __float2int_rn(px.y);
 
-    if (u < 0 || u >= img_w || v < 0 || v >= img_h) return;
+    if (u < 0 || u >= img_w || v < 0 || v >= img_h)
+        return;
 
     float d = depth[v * img_w + u];
-    if (d <= 0) return;
+    if (d <= 0)
+        return;
 
     // Distanza SDF = depth - z_camera
     float sdf = d - p_cam.z;
 
-    if (sdf < -truncation) return;  // dietro la superficie troppo in profondità
+    if (sdf < -truncation)
+        return; // dietro la superficie troppo in profondità
 
     float tsdf = fminf(1.f, sdf / truncation);
 
     // Aggiornamento running average (KinectFusion style)
-    TSDFVoxel& voxel = voxels[voxel_idx];
+    TSDFVoxel &voxel = voxels[voxel_idx];
     float w_new = 1.f;
     float w_old = voxel.weight;
 
-    voxel.tsdf   = (w_old * voxel.tsdf + w_new * tsdf) / (w_old + w_new);
-    voxel.weight = fminf(w_old + w_new, 100.f);  // cap weight
+    voxel.tsdf = (w_old * voxel.tsdf + w_new * tsdf) / (w_old + w_new);
+    voxel.weight = fminf(w_old + w_new, 100.f); // cap weight
 }
 
 // ─────────────────────────────────────────────
@@ -162,42 +169,55 @@ __global__ void tsdf_integrate_kernel(
 // ─────────────────────────────────────────────
 
 __global__ void compute_depth_normals_kernel(
-    const float*     depth,
-    float3*          normals,
-    int              w,
-    int              h,
+    const float *depth,
+    float3 *normals,
+    int w,
+    int h,
     CameraIntrinsics cam)
 {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     int v = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (u <= 0 || u >= w-1 || v <= 0 || v >= h-1) {
-        if (u < w && v < h) normals[v*w+u] = make_float3(0,0,0);
+    // Check image bounds
+    if (u >= w || v >= h)
         return;
-    }
 
-    float d   = depth[v*w + u];
-    float d_r = depth[v*w + u+1];
-    float d_l = depth[v*w + u-1];
-    float d_u = depth[(v-1)*w + u];
-    float d_d = depth[(v+1)*w + u];
+    // Default output: invalid normal (zero vector, could also use NaN)
+    normals[v * w + u] = make_float3(0, 0, 0);
 
-    if (d <= 0 || d_r <= 0 || d_l <= 0 || d_u <= 0 || d_d <= 0) {
-        normals[v*w+u] = make_float3(0,0,0);
+    // We need valid right and bottom neighbors
+    if (u >= w - 1 || v >= h - 1)
         return;
-    }
 
-    float3 p   = cam.unproject(u,   v,   d);
-    float3 p_r = cam.unproject(u+1, v,   d_r);
-    float3 p_u = cam.unproject(u,   v-1, d_u);
+    // Read depth values (assumed already in meters)
+    float d00 = depth[v * w + u];
+    float d01 = depth[v * w + (u + 1)];
+    float d10 = depth[(v + 1) * w + u];
 
-    float3 dx = make_float3(p_r.x-p.x, p_r.y-p.y, p_r.z-p.z);
-    float3 dy = make_float3(p_u.x-p.x, p_u.y-p.y, p_u.z-p.z);
+    // Skip invalid depth values
+    if (d00 <= 0 || d01 <= 0 || d10 <= 0)
+        return;
 
-    // Orient depth normals toward the camera, matching the TSDF gradient
-    // convention used by raycasting.
+    // Back-project pixels to 3D camera space
+    float3 p00 = cam.unproject(u, v, d00);
+    float3 p01 = cam.unproject(u + 1, v, d01);
+    float3 p10 = cam.unproject(u, v + 1, d10);
+
+    // Compute local surface tangents (forward differences)
+    float3 dx = make_float3(p01.x - p00.x, p01.y - p00.y, p01.z - p00.z);
+    float3 dy = make_float3(p10.x - p00.x, p10.y - p00.y, p10.z - p00.z);
+
+    // Compute normal via cross product (right-handed system)
     float3 n = cross3(dx, dy);
-    normals[v*w+u] = normalize3(n);
+
+    // Normalize the normal vector
+    n = normalize3(n);
+
+    // Flip normal to point toward the camera (KinectFusion convention)
+    n = make_float3(-n.x, -n.y, -n.z);
+
+    // Store result
+    normals[v * w + u] = n;
 }
 
 // ─────────────────────────────────────────────
@@ -205,50 +225,53 @@ __global__ void compute_depth_normals_kernel(
 // ─────────────────────────────────────────────
 
 __global__ void raycast_kernel(
-    const TSDFVoxel* voxels,
-    int3             dims,
-    float3           origin,
-    float            voxel_size,
-    float            truncation,
-    float3*          out_vertices,
-    float3*          out_normals,
-    int*             out_canonical_vidx,  // canonical voxel index per pixel (may be null)
-    int              img_w,
-    int              img_h,
+    const TSDFVoxel *voxels,
+    int3 dims,
+    float3 origin,
+    float voxel_size,
+    float truncation,
+    float3 *out_vertices,
+    float3 *out_normals,
+    int *out_canonical_vidx, // canonical voxel index per pixel (may be null)
+    int img_w,
+    int img_h,
     CameraIntrinsics cam,
-    Mat4             T_world_cam,
-    const DeformNode* nodes,
-    const Mat4*       transforms,
-    int               num_nodes,
-    const int*        voxel_knn,
-    const float*      voxel_knn_w,
-    bool              use_warp)
+    Mat4 T_world_cam,
+    const DeformNode *nodes,
+    const DualQuat *transforms,
+    int num_nodes,
+    const int *voxel_knn,
+    const float *voxel_knn_w,
+    bool use_warp)
 {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     int v = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (u >= img_w || v >= img_h) return;
+    if (u >= img_w || v >= img_h)
+        return;
 
     int px_idx = v * img_w + u;
-    out_vertices[px_idx] = make_float3(0,0,0);
-    out_normals [px_idx] = make_float3(0,0,0);
-    if (out_canonical_vidx) out_canonical_vidx[px_idx] = -1;
+    out_vertices[px_idx] = make_float3(0, 0, 0);
+    out_normals[px_idx] = make_float3(0, 0, 0);
+    if (out_canonical_vidx)
+        out_canonical_vidx[px_idx] = -1;
 
     // Raggio in world space
-    float3 ray_d_cam   = cam.unproject(u, v, 1.f);
-    float3 ray_origin  = T_world_cam.transform_point(make_float3(0,0,0));
-    float3 ray_dir     = normalize3(T_world_cam.transform_normal(ray_d_cam));
+    float3 ray_d_cam = cam.unproject(u, v, 1.f);
+    float3 ray_origin = T_world_cam.transform_point(make_float3(0, 0, 0));
+    float3 ray_dir = normalize3(T_world_cam.transform_normal(ray_d_cam));
 
     // Marching lungo il raggio
-    float t     = 0.05f; // start depth
+    float t = 0.05f; // start depth
     float t_max = 3.5f;
-    float step  = voxel_size * 0.8f;
+    float step = voxel_size * 0.8f;
 
     float tsdf_prev = 0;
-    bool  have_prev = false;
+    bool have_prev = false;
     float t_prev = t;
 
-    for (; t < t_max; t += step) {
+    for (; t < t_max; t += step)
+    {
         float3 p_world = make_float3(
             ray_origin.x + t * ray_dir.x,
             ray_origin.y + t * ray_dir.y,
@@ -257,13 +280,15 @@ __global__ void raycast_kernel(
         float tsdf_cur = 1.0f;
         int vidx = -1;
         if (!sample_tsdf_trilinear(voxels, dims, origin, voxel_size,
-                                   p_world, tsdf_cur, vidx)) {
+                                   p_world, tsdf_cur, vidx))
+        {
             have_prev = false;
             continue;
         }
 
         // Zero crossing: tsdf cambia segno
-        if (have_prev && tsdf_prev > 0 && tsdf_cur <= 0 && tsdf_prev < 1.0f) {
+        if (have_prev && tsdf_prev > 0 && tsdf_cur <= 0 && tsdf_prev < 1.0f)
+        {
             // Interpolazione lineare per trovare la superficie esatta
             float t_surface = t - (t - t_prev) * tsdf_cur / (tsdf_cur - tsdf_prev);
 
@@ -297,19 +322,21 @@ __global__ void raycast_kernel(
             float3 normal = normalize3(grad);
 
             // Output canonical voxel index for pixel_knn lookup
-            if (out_canonical_vidx) out_canonical_vidx[px_idx] = vidx;
+            if (out_canonical_vidx)
+                out_canonical_vidx[px_idx] = vidx;
 
             // Apply warp to get live-space vertex
             float3 p_live = p_surface;
-            if (use_warp && num_nodes > 0) {
-                const int*   knn   = voxel_knn   + vidx * K_NEIGHBORS;
-                const float* knn_w = voxel_knn_w + vidx * K_NEIGHBORS;
+            if (use_warp && num_nodes > 0)
+            {
+                const int *knn = voxel_knn + vidx * K_NEIGHBORS;
+                const float *knn_w = voxel_knn_w + vidx * K_NEIGHBORS;
                 p_live = warp_point(p_surface, nodes, transforms, knn, knn_w);
                 normal = warp_normal(normal, transforms, knn, knn_w);
             }
 
             out_vertices[px_idx] = p_live;
-            out_normals [px_idx] = normal;
+            out_normals[px_idx] = normal;
             break;
         }
 
@@ -329,17 +356,18 @@ __global__ void raycast_kernel(
 // ─────────────────────────────────────────────
 
 __global__ void apply_twist_increment_kernel(
-    const float* delta_x,   // [num_nodes * 6]
-    Mat4*        transforms, // [num_nodes]
-    int          num_nodes)
+    const float *delta_x, // [num_nodes * 6]
+    DualQuat *transforms, // [num_nodes]
+    int num_nodes)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_nodes) return;
+    if (i >= num_nodes)
+        return;
 
-    Mat4 dT = exp_se3(&delta_x[i * 6]);
+    DualQuat dT = dq_from_twist(&delta_x[i * 6]);
 
     // T_i ← dT · T_i  (composizione a sinistra)
-    transforms[i] = dT * transforms[i];
+    transforms[i] = dq_mul(dT, transforms[i]);
 }
 
 // ─────────────────────────────────────────────
@@ -347,29 +375,30 @@ __global__ void apply_twist_increment_kernel(
 // ─────────────────────────────────────────────
 
 __global__ void find_correspondences_kernel(
-    const float3*      live_vertices,   // vertici raycasted [H*W]
-    const float3*      live_normals,
-    const float*       depth_map,       // depth frame corrente
-    const float3*      depth_normals,   // normali depth frame
-    Correspondence*    corrs,
-    int*               num_valid,
-    int                img_w,
-    int                img_h,
-    CameraIntrinsics   cam,
-    Mat4               T_cam_world,
-    Mat4               T_world_cam,
+    const float3 *live_vertices, // vertici raycasted [H*W]
+    const float3 *live_normals,
+    const float *depth_map,      // depth frame corrente
+    const float3 *depth_normals, // normali depth frame
+    Correspondence *corrs,
+    int *num_valid,
+    int img_w,
+    int img_h,
+    CameraIntrinsics cam,
+    Mat4 T_cam_world,
+    Mat4 T_world_cam,
     // k-NN per ogni pixel live
-    const int*         pixel_knn,       // [H*W*K] — nodi per pixel
-    const float*       pixel_knn_w,
-    float              dist_threshold,
-    float              angle_threshold,
-    float              view_threshold,
-    int                search_radius_px,
-    int*               debug_stats)
+    const int *pixel_knn, // [H*W*K] — nodi per pixel
+    const float *pixel_knn_w,
+    float dist_threshold,
+    float angle_threshold,
+    float view_threshold,
+    int search_radius_px,
+    int *debug_stats)
 {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     int v = blockIdx.y * blockDim.y + threadIdx.y;
-    if (u >= img_w || v >= img_h) return;
+    if (u >= img_w || v >= img_h)
+        return;
 
     int px = v * img_w + u;
 
@@ -380,16 +409,20 @@ __global__ void find_correspondences_kernel(
     float3 v_live = live_vertices[px];
     float3 n_live = live_normals[px];
 
-    if (norm3(v_live) < 1e-6f || norm3(n_live) < 1e-6f) {
-        if (debug_stats) atomicAdd(&debug_stats[0], 1);
+    if (norm3(v_live) < 1e-6f || norm3(n_live) < 1e-6f)
+    {
+        if (debug_stats)
+            atomicAdd(&debug_stats[0], 1);
         goto store;
     }
 
     {
         // Proietta vertice live nel depth frame
         float3 v_cam = T_cam_world.transform_point(v_live);
-        if (v_cam.z <= 0) {
-            if (debug_stats) atomicAdd(&debug_stats[1], 1);
+        if (v_cam.z <= 0)
+        {
+            if (debug_stats)
+                atomicAdd(&debug_stats[1], 1);
             goto store;
         }
 
@@ -397,12 +430,14 @@ __global__ void find_correspondences_kernel(
         int pu = __float2int_rn(proj.x);
         int pv = __float2int_rn(proj.y);
 
-        if (pu < 0 || pu >= img_w || pv < 0 || pv >= img_h) {
-            if (debug_stats) atomicAdd(&debug_stats[1], 1);
+        if (pu < 0 || pu >= img_w || pv < 0 || pv >= img_h)
+        {
+            if (debug_stats)
+                atomicAdd(&debug_stats[1], 1);
             goto store;
         }
 
-        float3 n_cam   = T_cam_world.transform_normal(n_live);
+        float3 n_cam = T_cam_world.transform_normal(n_live);
         float3 best_dst = make_float3(0, 0, 0);
         float3 best_n = make_float3(0, 0, 0);
         float best_score = dist_threshold;
@@ -412,8 +447,10 @@ __global__ void find_correspondences_kernel(
         float view_eps = fmaxf(1.0f - view_threshold, 1e-4f);
         float3 view_dir = normalize3(make_float3(-v_cam.x, -v_cam.y, -v_cam.z));
         float view_cos = fabsf(dot3(n_cam, view_dir));
-        if (view_cos < view_threshold) {
-            if (debug_stats) atomicAdd(&debug_stats[4], 1);
+        if (view_cos < view_threshold)
+        {
+            if (debug_stats)
+                atomicAdd(&debug_stats[4], 1);
             goto store;
         }
         bool saw_depth = false;
@@ -423,32 +460,41 @@ __global__ void find_correspondences_kernel(
         // Projective ICP with a small local search. A single rounded pixel is
         // fragile when the warp is still catching up or the depth has holes.
         int radius = max(0, search_radius_px);
-        for (int dy = -radius; dy <= radius; dy++) {
+        for (int dy = -radius; dy <= radius; dy++)
+        {
             int y = pv + dy;
-            if (y < 0 || y >= img_h) continue;
-            for (int dx = -radius; dx <= radius; dx++) {
+            if (y < 0 || y >= img_h)
+                continue;
+            for (int dx = -radius; dx <= radius; dx++)
+            {
                 int x = pu + dx;
-                if (x < 0 || x >= img_w) continue;
+                if (x < 0 || x >= img_w)
+                    continue;
 
                 float d_dst = depth_map[y * img_w + x];
-                if (d_dst <= 0) continue;
+                if (d_dst <= 0)
+                    continue;
                 saw_depth = true;
 
                 float3 v_dst = cam.unproject(x, y, d_dst);
                 float3 diff = make_float3(v_cam.x - v_dst.x,
-                               v_cam.y - v_dst.y,
-                               v_cam.z - v_dst.z);
+                                          v_cam.y - v_dst.y,
+                                          v_cam.z - v_dst.z);
                 float euclidean_dist = norm3(diff);
-                if (euclidean_dist > euclidean_cap) continue;
+                if (euclidean_dist > euclidean_cap)
+                    continue;
 
                 float3 n_dst = depth_normals[y * img_w + x];
-                if (norm3(n_dst) < 1e-6f) continue;
+                if (norm3(n_dst) < 1e-6f)
+                    continue;
                 float cosine = fabsf(dot3(n_cam, n_dst));
-                if (cosine < angle_threshold) continue;
+                if (cosine < angle_threshold)
+                    continue;
                 saw_angle = true;
 
                 float plane_dist = fabsf(dot3(n_dst, diff));
-                if (plane_dist > dist_threshold || plane_dist >= best_score) continue;
+                if (plane_dist > dist_threshold || plane_dist >= best_score)
+                    continue;
                 saw_close = true;
 
                 float phi_d = fmaxf(0.0f, 1.0f - euclidean_dist / euclidean_cap);
@@ -464,35 +510,43 @@ __global__ void find_correspondences_kernel(
             }
         }
 
-        if (!saw_depth) {
-            if (debug_stats) atomicAdd(&debug_stats[2], 1);
+        if (!saw_depth)
+        {
+            if (debug_stats)
+                atomicAdd(&debug_stats[2], 1);
             goto store;
         }
-        if (!saw_close) {
-            if (debug_stats) atomicAdd(&debug_stats[3], 1);
+        if (!saw_close)
+        {
+            if (debug_stats)
+                atomicAdd(&debug_stats[3], 1);
             goto store;
         }
-        if (!saw_angle) {
-            if (debug_stats) atomicAdd(&debug_stats[4], 1);
+        if (!saw_angle)
+        {
+            if (debug_stats)
+                atomicAdd(&debug_stats[4], 1);
             goto store;
         }
 
         // Salva corrispondenza
-        corr.src    = v_live;
-        corr.dst    = T_world_cam.transform_point(best_dst);
+        corr.src = v_live;
+        corr.dst = T_world_cam.transform_point(best_dst);
         corr.normal = normalize3(T_world_cam.transform_normal(best_n));
         corr.weight = best_weight;
-        corr.valid  = true;
+        corr.valid = true;
 
-        // Copia k-NN nodi per questo pixel
-        #pragma unroll
-        for (int k = 0; k < K_NEIGHBORS; k++) {
-            corr.node_ids[k] = pixel_knn  [px * K_NEIGHBORS + k];
-            corr.node_ws [k] = pixel_knn_w[px * K_NEIGHBORS + k];
+// Copia k-NN nodi per questo pixel
+#pragma unroll
+        for (int k = 0; k < K_NEIGHBORS; k++)
+        {
+            corr.node_ids[k] = pixel_knn[px * K_NEIGHBORS + k];
+            corr.node_ws[k] = pixel_knn_w[px * K_NEIGHBORS + k];
         }
 
         atomicAdd(num_valid, 1);
-        if (debug_stats) atomicAdd(&debug_stats[5], 1);
+        if (debug_stats)
+            atomicAdd(&debug_stats[5], 1);
     }
 
 store:
@@ -508,63 +562,76 @@ store:
 // ─────────────────────────────────────────────
 
 __global__ void compute_pixel_knn_kernel(
-    const int*    canonical_vidx,  // from raycast: canonical voxel hit per pixel
-    int           img_w,
-    int           img_h,
-    const int*    voxel_knn,
-    const float*  voxel_knn_w,
-    int*          pixel_knn,
-    float*        pixel_knn_w)
+    const int *canonical_vidx, // from raycast: canonical voxel hit per pixel
+    int img_w,
+    int img_h,
+    const int *voxel_knn,
+    const float *voxel_knn_w,
+    int *pixel_knn,
+    float *pixel_knn_w)
 {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     int v = blockIdx.y * blockDim.y + threadIdx.y;
-    if (u >= img_w || v >= img_h) return;
+    if (u >= img_w || v >= img_h)
+        return;
 
     int px = v * img_w + u;
 
-    for (int k = 0; k < K_NEIGHBORS; k++) {
-        pixel_knn  [px * K_NEIGHBORS + k] = -1;
+    for (int k = 0; k < K_NEIGHBORS; k++)
+    {
+        pixel_knn[px * K_NEIGHBORS + k] = -1;
         pixel_knn_w[px * K_NEIGHBORS + k] = 0.f;
     }
 
     int vidx = canonical_vidx[px];
-    if (vidx < 0) return;
+    if (vidx < 0)
+        return;
 
-    for (int k = 0; k < K_NEIGHBORS; k++) {
-        pixel_knn  [px * K_NEIGHBORS + k] = voxel_knn  [vidx * K_NEIGHBORS + k];
+    for (int k = 0; k < K_NEIGHBORS; k++)
+    {
+        pixel_knn[px * K_NEIGHBORS + k] = voxel_knn[vidx * K_NEIGHBORS + k];
         pixel_knn_w[px * K_NEIGHBORS + k] = voxel_knn_w[vidx * K_NEIGHBORS + k];
     }
 }
 
 __global__ void mark_optimized_voxels_kernel(
-    const Correspondence* corrs,
-    const int*            canonical_vidx,
-    int                   n_pixels,
-    int3                  dims,
-    int                   frame_id,
-    int*                  voxel_opt_counts,
-    int*                  voxel_opt_frame)
+    const Correspondence *corrs,
+    const int *canonical_vidx,
+    int n_pixels,
+    int3 dims,
+    int frame_id,
+    int *voxel_opt_counts,
+    int *voxel_opt_frame)
 {
     int px = blockIdx.x * blockDim.x + threadIdx.x;
-    if (px >= n_pixels) return;
-    if (!corrs[px].valid || corrs[px].weight <= 0.0f) return;
+    if (px >= n_pixels)
+        return;
+    if (!corrs[px].valid || corrs[px].weight <= 0.0f)
+        return;
 
     int vidx = canonical_vidx[px];
-    if (vidx < 0) return;
+    if (vidx < 0)
+        return;
 
     int vx = vidx % dims.x;
     int vy = (vidx / dims.x) % dims.y;
     int vz = vidx / (dims.x * dims.y);
 
-    for (int dz = -1; dz <= 1; dz++) {
+    for (int dz = -1; dz <= 1; dz++)
+    {
         int z = vz + dz;
-        if (z < 0 || z >= dims.z) continue;
-        for (int dy = -1; dy <= 1; dy++) {
+        if (z < 0 || z >= dims.z)
+            continue;
+        for (int dy = -1; dy <= 1; dy++)
+        {
             int y = vy + dy;
-            if (y < 0 || y >= dims.y) continue;
-            for (int dx = -1; dx <= 1; dx++) {
+            if (y < 0 || y >= dims.y)
+                continue;
+            for (int dx = -1; dx <= 1; dx++)
+            {
                 int x = vx + dx;
-                if (x < 0 || x >= dims.x) continue;
+                if (x < 0 || x >= dims.x)
+                    continue;
                 int nidx = z * dims.x * dims.y + y * dims.x + x;
                 int prev = atomicExch(&voxel_opt_frame[nidx], frame_id);
                 if (prev != frame_id)
@@ -578,10 +645,11 @@ __global__ void mark_optimized_voxels_kernel(
 //  Bounding box filter
 // ─────────────────────────────────────────────
 
-__global__ void bbox_filter_kernel(float3* vertices, int n, float3 min_pt, float3 max_pt)
+__global__ void bbox_filter_kernel(float3 *vertices, int n, float3 min_pt, float3 max_pt)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    if (i >= n)
+        return;
     float3 v = vertices[i];
     if (v.x < min_pt.x || v.x > max_pt.x ||
         v.y < min_pt.y || v.y > max_pt.y ||
@@ -590,19 +658,21 @@ __global__ void bbox_filter_kernel(float3* vertices, int n, float3 min_pt, float
 }
 
 __global__ void depth_bbox_filter_kernel(
-    float*           depth,
-    int              w,
-    int              h,
+    float *depth,
+    int w,
+    int h,
     CameraIntrinsics cam,
-    float3           min_pt,
-    float3           max_pt)
+    float3 min_pt,
+    float3 max_pt)
 {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     int v = blockIdx.y * blockDim.y + threadIdx.y;
-    if (u >= w || v >= h) return;
+    if (u >= w || v >= h)
+        return;
 
     float d = depth[v * w + u];
-    if (d <= 0.f) return;
+    if (d <= 0.f)
+        return;
 
     float3 p = cam.unproject((float)u, (float)v, d);
     if (p.x < min_pt.x || p.x > max_pt.x ||

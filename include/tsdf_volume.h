@@ -29,7 +29,7 @@ public:
         const Mat4 &camera_pose,
         // Warp field (DynamicFusion)
         const DeformNode *nodes = nullptr,
-        const Mat4 *transforms = nullptr,
+        const DualQuat *transforms = nullptr,
         int num_nodes = 0,
         const int *voxel_knn = nullptr,      // [vol_size * K]
         const float *voxel_knn_w = nullptr,  // [vol_size * K]
@@ -43,7 +43,7 @@ public:
         const CameraIntrinsics &cam,
         const Mat4 &camera_pose,
         const DeformNode *nodes = nullptr,
-        const Mat4 *transforms = nullptr,
+        const DualQuat *transforms = nullptr,
         int num_nodes = 0,
         const int *voxel_knn = nullptr,
         const float *voxel_knn_w = nullptr,

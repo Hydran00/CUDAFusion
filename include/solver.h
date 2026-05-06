@@ -27,7 +27,7 @@ class GaussNewtonSolver {
       // Corrispondenze ICP
       const DeviceArray<Correspondence>& corrs, int num_corrs,
       // Grafo di deformazione
-      const DeformNode* d_nodes, const Mat4* d_transforms, int num_nodes,
+      const DeformNode* d_nodes, const DualQuat* d_transforms, int num_nodes,
       // Output
       DeviceArray<float>& delta_x);
 
@@ -56,7 +56,7 @@ class GaussNewtonSolver {
   // ── Kernel wrappers ───────────────────────────
 
   void assemble_system(const DeviceArray<Correspondence>& corrs, int num_corrs,
-                       const DeformNode* d_nodes, const Mat4* d_transforms,
+                       const DeformNode* d_nodes, const DualQuat* d_transforms,
                        int num_nodes);
 
   void build_sparsity_pattern(const DeformNode* h_nodes, int num_nodes);

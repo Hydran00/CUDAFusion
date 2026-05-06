@@ -15,40 +15,40 @@ camera:
   height: 480
 
 tsdf:
-  dims: [192, 192, 192]
-  voxel_size: 0.008
-  truncation: 0.04
+  dims: [256, 256, 256]
+  voxel_size: 0.005
+  truncation: 0.03
   origin: [-0.768, -0.768, 0.05]
 
 solver:
-  gn_iterations: 30
-  pcg_iterations: 24
-  lambda_smooth: 10.0
-  lambda_damping: 5.0
+  gn_iterations: 2
+  pcg_iterations: 12   # ridotto da 400: evita over-optimization
+  lambda_smooth: 20.0 # arap
+  lambda_damping: 0.05 # aumentato per più regolarizzazione
 
 warp:
-  node_radius: 0.10
-  node_min_dist: 0.06
-  max_nodes: 1024
-  node_update_every_n: 10
-  max_dx_mean: 0.03
-  max_update_rot: 0.02
-  max_update_trans: 0.01
-  update_scale: 0.10
+  node_radius: 0.03
+  node_min_dist: 0.025
+  max_nodes: 8192
+  node_update_every_n: 2
+  max_dx_mean: 0.2    # ridotto da 2.0: limita deformazioni locali
+  max_update_rot: 0.12  # ~7°, prevenire salti grandi
+  max_update_trans: 0.04  # 4cm, contenere step size
+  update_scale: 0.08  # ridotto da 0.1: step più piccoli
   integrate_warped: true
-  integrate_min_optimized_count: 3
+  integrate_min_optimized_count: 0
   integrate_unwarped_fallback: false
 
 icp:
   rigid_tracking: true
-  dist_threshold: 0.06
-  angle_threshold: 0.75
+  dist_threshold: 0.005
+  angle_threshold: 0.85
   view_threshold: 0.2
-  search_radius_px: 8
-  min_valid_corrs: 500
+  search_radius_px: 1
+  min_valid_corrs: 50
 
 sift:
-  enabled: false
+  enabled: true
   max_features: 8192
   max_history: 8
   max_matches_per_frame: 48
@@ -60,7 +60,7 @@ sift:
   weight: 0.25
 
 bbox:
-  enabled: true
+  enabled: false
   min_pt: [-1.0, -1.0, 0.01]
   max_pt: [1.0, 1.0, 1.8]
 

@@ -33,7 +33,8 @@ class WarpField {
   // Aggiunge nodi dalla superficie appena estratta
   // Restituisce quanti nodi sono stati aggiunti
   int add_nodes_from_surface(const std::vector<float3>& surface_vertices,
-                             float min_dist_between_nodes);
+                             float min_dist_between_nodes,
+                             const std::vector<float3>* surface_normals = nullptr);
 
   // Inizializza trasformazione nuovo nodo
   // per interpolazione dai vicini esistenti
@@ -53,11 +54,11 @@ class WarpField {
   // ── Accesso GPU ───────────────────────────────
 
   DeformNode* device_nodes() { return d_nodes_.data; }
-  Mat4* device_transforms() { return d_transforms_.data; }
-  Mat4* device_transforms_prev() { return d_transforms_prev_.data; }
+  DualQuat* device_transforms() { return d_transforms_.data; }
+  DualQuat* device_transforms_prev() { return d_transforms_prev_.data; }
 
   const DeformNode* device_nodes() const { return d_nodes_.data; }
-  const Mat4* device_transforms() const { return d_transforms_.data; }
+  const DualQuat* device_transforms() const { return d_transforms_.data; }
 
   // ── Aggiornamento trasformazioni ──────────────
 
@@ -75,11 +76,11 @@ class WarpField {
 
   // CPU access per debug/export
   std::vector<DeformNode> download_nodes() const;
-  std::vector<Mat4> download_transforms() const;
+  std::vector<DualQuat> download_transforms() const;
 
   // Upload nodi modificati su CPU (per aggiunta nodi)
   void upload_nodes(const std::vector<DeformNode>& nodes);
-  void upload_transforms(const std::vector<Mat4>& transforms);
+  void upload_transforms(const std::vector<DualQuat>& transforms);
 
  private:
   float node_radius_;
@@ -88,12 +89,12 @@ class WarpField {
 
   // GPU arrays (pre-allocati a MAX_NODES)
   DeviceArray<DeformNode> d_nodes_;
-  DeviceArray<Mat4> d_transforms_;
-  DeviceArray<Mat4> d_transforms_prev_;
+  DeviceArray<DualQuat> d_transforms_;
+  DeviceArray<DualQuat> d_transforms_prev_;
 
   // CPU mirror (per aggiornamenti incrementali)
   std::vector<DeformNode> h_nodes_;
-  std::vector<Mat4> h_transforms_;
+  std::vector<DualQuat> h_transforms_;
 
   // Spatial hash per k-NN query
   SpatialHash spatial_hash_;

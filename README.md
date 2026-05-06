@@ -4,7 +4,7 @@ A real-time volumetric fusion system implemented in CUDA that reconstructs dynam
 
 ## Overview
 
-**DynamicFusion** is a state-of-the-art algorithm for fusing depth data from RGB-D sensors into a coherent 3D reconstruction that adapts to non-rigid deformations. This CUDA implementation accelerates the algorithm for real-time performance.
+**CUDAFusion** is a state-of-the-art algorithm for fusing depth data from RGB-D sensors (based on an improved version of DynamicFusion) into a coherent 3D reconstruction that adapts to non-rigid deformations. This CUDA implementation accelerates the algorithm for real-time performance.
 
 ### Key Features
 
@@ -206,8 +206,8 @@ where w_n = gaussian_weight(distance(point, p_n))
 
 ```bash
 # Dependencies
-sudo apt-get install libopencv-dev libyaml-cpp-dev libcuda-dev
-
+# Install CUDA Toolkit, then 
+sudo apt-get install libopencv-dev libyaml-cpp-dev
 # Build
 cd myfusion
 mkdir -p build && cd build
@@ -221,16 +221,10 @@ make -j$(nproc)
 ```bash
 ./build/run_fusion
 ```
-Generates 30 synthetic depth frames of a moving sphere.
 
 #### 2. **With Config File**
 ```bash
 ./build/run_fusion config/params.yaml
-```
-
-#### 3. **With Real Dataset**
-```bash
-./build/run_fusion /path/to/dataset/config.yaml --vis
 ```
 
 ### Command-Line Options

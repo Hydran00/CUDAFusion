@@ -52,6 +52,7 @@ target_link_libraries(dfusion
     CUDA::cudart
     CUDA::cublas
     yaml-cpp::yaml-cpp
+    Open3D::Open3D
 )
 
 # Main executable

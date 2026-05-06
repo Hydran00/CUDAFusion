@@ -1,3 +1,5 @@
+#include <unistd.h>
+
 #include "fusion_app.h"
 
 /**
@@ -209,8 +211,9 @@ int main(int argc, char **argv) {
         vis->AddGeometry(vis_mesh);
       }
 
-      // On subsequent frames: update mesh if new data was integrated
-      if (frame_idx > 1 && pipeline.last_frame_integrated()) {
+      // On subsequent frames: update every frame so accepted warp updates are
+      // visible even when TSDF integration is skipped.
+      if (frame_idx > 1) {
         pipeline.update_o3d_mesh(*vis_mesh);
         vis->UpdateGeometry(vis_mesh);
       }
@@ -218,6 +221,10 @@ int main(int argc, char **argv) {
       // Keep the visualization window responsive
       vis->PollEvents();
       vis->UpdateRender();
+      // sleep_for(10ms) can be added here if the loop is too fast and CPU usage
+      // is high
+
+      sleep(0.050);
     }
 
     // ── Checkpoint: Save mesh every 30 frames ──────────────────────

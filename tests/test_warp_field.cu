@@ -22,6 +22,7 @@
 
 #include "types.h"
 #include "warp_field.h"
+#include "se3_math.cuh"
 
 // ─────────────────────────────────────────────────────────────────
 // Utility Functions
@@ -205,7 +206,7 @@ void visualize_warp_field(const std::vector<float3> &surface,
  */
 float3 warp_point_cpu(float3 point,
                       const std::vector<DeformNode> &nodes,
-                      const std::vector<Mat4> &transforms)
+                      const std::vector<DualQuat> &transforms)
 {
     float3 warped = make_float3(0, 0, 0);
     float total_weight = 0.0f;
@@ -223,16 +224,8 @@ float3 warp_point_cpu(float3 point,
         if (weight > 1e-6f)
         {
             // Apply weighted transformation
-            float3 centered = make_float3(
-                point.x - nodes[i].pos.x,
-                point.y - nodes[i].pos.y,
-                point.z - nodes[i].pos.z);
-
-            float3 rotated = transforms[i].transform_normal(centered);
-            float3 transformed = make_float3(
-                nodes[i].pos.x + rotated.x + transforms[i].m[0][3],
-                nodes[i].pos.y + rotated.y + transforms[i].m[1][3],
-                nodes[i].pos.z + rotated.z + transforms[i].m[2][3]);
+            float3 transformed =
+                dq_transform_point_centered(transforms[i], point, nodes[i].pos);
 
             warped.x += weight * transformed.x;
             warped.y += weight * transformed.y;
@@ -437,7 +430,7 @@ int main(int argc, char **argv)
         int identity_count = 0;
         for (int i = 0; i < std::min(5, (int)h_transforms.size()); i++)
         {
-            const Mat4 &T = h_transforms[i];
+            const Mat4 T = dq_to_mat4(h_transforms[i]);
 
             bool is_identity = true;
             for (int r = 0; r < 4; r++)
@@ -474,11 +467,14 @@ int main(int argc, char **argv)
 
         if (visualize)
         {
-            std::vector<Mat4> demo_transforms = h_transforms;
+            std::vector<DualQuat> demo_transforms = h_transforms;
             for (int i = 0; i < std::min(3, (int)demo_transforms.size()); i++)
             {
-                demo_transforms[i].m[0][3] += 0.015f * (i + 1);
-                demo_transforms[i].m[1][3] += 0.007f * (i + 1);
+                float3 t = dq_translation(demo_transforms[i]);
+                t.x += 0.015f * (i + 1);
+                t.y += 0.007f * (i + 1);
+                demo_transforms[i] =
+                    dq_from_rotation_translation(demo_transforms[i].real, t);
             }
 
             std::vector<float3> warped_surface;

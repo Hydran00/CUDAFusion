@@ -83,6 +83,16 @@ struct Mat4 {
     }
 };
 
+struct DualQuat {
+    float4 real; // rotation quaternion (x, y, z, w)
+    float4 dual; // dual part encoding translation
+
+    __host__ __device__ DualQuat()
+        : real{0.f, 0.f, 0.f, 1.f}, dual{0.f, 0.f, 0.f, 0.f} {}
+
+    __host__ __device__ static DualQuat identity() { return DualQuat(); }
+};
+
 // ─────────────────────────────────────────────
 //  GPU Device Array wrapper
 // ─────────────────────────────────────────────
@@ -174,6 +184,7 @@ static constexpr int K_GRAPH     = 8;   // vicini nel grafo nodi
 
 struct DeformNode {
     float3 pos;          // posizione nel canonical frame
+    float3 normal;       // canonical/world surface normal used to reject cross-surface edges
     float  radius;       // sigma per i pesi (influenza)
     int    neighbors[K_GRAPH];    // indici nodi vicini nel grafo
     float  neighbor_w[K_GRAPH];   // pesi archi smoothness
