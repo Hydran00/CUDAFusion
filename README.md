@@ -1,4 +1,4 @@
-# DynamicFusion - CUDA-Accelerated 3D Reconstruction
+# CUDA-Accelerated Non-rigid 3D Reconstruction (DynamicFusion implementation)
 
 A real-time volumetric fusion system implemented in CUDA that reconstructs dynamic 3D scenes from depth sensor sequences. This implementation combines non-rigid surface tracking with volumetric TSDF fusion to handle scenes with deforming objects.
 
