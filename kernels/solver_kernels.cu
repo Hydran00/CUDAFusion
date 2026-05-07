@@ -212,6 +212,10 @@ __global__ void assemble_smooth_term_kernel(
     // Delta per Huber sullo smoothness: es. 5cm.
     // Se un arco si allunga più di così, il suo contributo viene smorzato.
     const float huber_smooth_delta = 0.05f;
+    // Adaptive strain weighting: if an edge stretches/compresses by roughly
+    // alpha or more, its ARAP stiffness drops smoothly instead of forcing a
+    // bad bridge to stay rigid.
+    const float strain_alpha = 0.25f;
 
     for (int k = 0; k < node_i.num_neighbors; k++)
     {
@@ -223,10 +227,30 @@ __global__ void assemble_smooth_term_kernel(
         if (nj <= ni)
             continue;
 
+        float original_w = fmaxf(node_i.neighbor_w[k], 0.0f);
+        if (original_w <= 1e-8f)
+            continue;
+
         float3 xj = nodes[nj].pos;
+        float3 xi = node_i.pos;
 
         float3 Ti_xj = dq_transform_point_centered(transforms[ni], xj, node_i.pos);
+        float3 Ti_xi = dq_transform_point_centered(transforms[ni], xi, node_i.pos);
         float3 Tj_xj = dq_transform_point_centered(transforms[nj], xj, nodes[nj].pos);
+
+        float3 rest_edge = make_float3(xi.x - xj.x, xi.y - xj.y, xi.z - xj.z);
+        float3 curr_edge = make_float3(Ti_xi.x - Tj_xj.x,
+                                       Ti_xi.y - Tj_xj.y,
+                                       Ti_xi.z - Tj_xj.z);
+        float dist_rest = sqrtf(rest_edge.x * rest_edge.x +
+                                rest_edge.y * rest_edge.y +
+                                rest_edge.z * rest_edge.z);
+        float dist_curr = sqrtf(curr_edge.x * curr_edge.x +
+                                curr_edge.y * curr_edge.y +
+                                curr_edge.z * curr_edge.z);
+        float strain = fabsf(dist_curr - dist_rest) / fmaxf(dist_rest, 1e-6f);
+        float strain_ratio = strain / strain_alpha;
+        float strain_weight = expf(-(strain_ratio * strain_ratio));
 
         float3 r = make_float3(
             Ti_xj.x - Tj_xj.x,
@@ -238,7 +262,9 @@ __global__ void assemble_smooth_term_kernel(
 
         // Calcolo del peso di Huber per lo smoothness
         float huber_w = compute_huber_weight(r_norm, huber_smooth_delta);
-        float effective_lambda = lambda * huber_w;
+        float effective_lambda = lambda * original_w * huber_w * strain_weight;
+        if (effective_lambda <= 1e-8f)
+            continue;
 
         float Ji[6][3], Jj[6][3];
 
