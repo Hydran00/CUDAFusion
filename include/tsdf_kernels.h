@@ -21,6 +21,28 @@ __global__ void tsdf_integrate_kernel(
     int min_opt_count,
     bool use_warp);
 
+__global__ void tsdf_integrate_kernel(
+    TSDFVoxel *voxels,
+    int3 dims,
+    float3 origin,
+    float voxel_size,
+    float truncation,
+    const float *depth,
+    int img_w,
+    int img_h,
+    CameraIntrinsics cam,
+    Mat4 T_cam_world,
+    const DeformNode *nodes,
+    const DualQuat *transforms,
+    int num_nodes,
+    const int *voxel_knn,
+    const float *voxel_knn_w,
+    const int *voxel_opt_counts,
+    int min_opt_count,
+    bool use_warp,
+    float decay_alpha,
+    float max_weight);
+
 __global__ void raycast_kernel(
     const TSDFVoxel *voxels,
     int3 dims,

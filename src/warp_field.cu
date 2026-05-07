@@ -194,42 +194,6 @@ __global__ void compute_voxel_knn_kernel(
         origin.y + (vy + 0.5f) * voxel_size,
         origin.z + (vz + 0.5f) * voxel_size);
 
-    // ───────────────────────────────────────────────
-    // Calcola gradiente TSDF locale (normale approssimativa)
-    // usando differenze finite centrali
-    // ───────────────────────────────────────────────
-    float3 voxel_normal = make_float3(0, 0, 0);
-
-    if (vx > 0 && vx < dims.x - 1 &&
-        vy > 0 && vy < dims.y - 1 &&
-        vz > 0 && vz < dims.z - 1)
-    {
-
-        int vx_m = vx - 1, vx_p = vx + 1;
-        int vy_m = vy - 1, vy_p = vy + 1;
-        int vz_m = vz - 1, vz_p = vz + 1;
-
-        int idx_xm = vz * dims.x * dims.y + vy * dims.x + vx_m;
-        int idx_xp = vz * dims.x * dims.y + vy * dims.x + vx_p;
-        int idx_ym = vz * dims.x * dims.y + vy_m * dims.x + vx;
-        int idx_yp = vz * dims.x * dims.y + vy_p * dims.x + vx;
-        int idx_zm = vz_m * dims.x * dims.y + vy * dims.x + vx;
-        int idx_zp = vz_p * dims.x * dims.y + vy * dims.x + vx;
-
-        float dx = (voxels[idx_xp].weight > 0 && voxels[idx_xm].weight > 0) ? (voxels[idx_xp].tsdf - voxels[idx_xm].tsdf) / (2.0f * voxel_size) : 0;
-        float dy = (voxels[idx_yp].weight > 0 && voxels[idx_ym].weight > 0) ? (voxels[idx_yp].tsdf - voxels[idx_ym].tsdf) / (2.0f * voxel_size) : 0;
-        float dz = (voxels[idx_zp].weight > 0 && voxels[idx_zm].weight > 0) ? (voxels[idx_zp].tsdf - voxels[idx_zm].tsdf) / (2.0f * voxel_size) : 0;
-
-        voxel_normal = make_float3(dx, dy, dz);
-        float n_mag = sqrtf(dx * dx + dy * dy + dz * dz);
-        if (n_mag > 1e-6f)
-        {
-            voxel_normal.x /= n_mag;
-            voxel_normal.y /= n_mag;
-            voxel_normal.z /= n_mag;
-        }
-    }
-
     float best_dist[K_NEIGHBORS];
     int best_id[K_NEIGHBORS];
 
@@ -239,7 +203,9 @@ __global__ void compute_voxel_knn_kernel(
         best_id[k] = -1;
     }
 
-    // KNN brute force con filtro orientamento
+    // Match the host skinning path: pure geometric KNN in canonical space.
+    // The previous normal-orientation filter can reject valid influences when
+    // TSDF gradients are noisy, leaving vertices/correspondences underconstrained.
     for (int ni = 0; ni < num_nodes; ni++)
     {
 
@@ -249,30 +215,6 @@ __global__ void compute_voxel_knn_kernel(
             p.z - nodes[ni].pos.z);
 
         float dist2 = d.x * d.x + d.y * d.y + d.z * d.z;
-
-        // Filtro orientamento: scarta nodi con normale opposta o non allineata
-        // (evita membrane tra superfici che si affrontano diversamente)
-        float normal_dot = voxel_normal.x * nodes[ni].normal.x +
-                           voxel_normal.y * nodes[ni].normal.y +
-                           voxel_normal.z * nodes[ni].normal.z;
-
-        float vn_mag = sqrtf(voxel_normal.x * voxel_normal.x +
-                             voxel_normal.y * voxel_normal.y +
-                             voxel_normal.z * voxel_normal.z);
-        float nn_mag = sqrtf(nodes[ni].normal.x * nodes[ni].normal.x +
-                             nodes[ni].normal.y * nodes[ni].normal.y +
-                             nodes[ni].normal.z * nodes[ni].normal.z);
-
-        // Se almeno una normale è mal definita (weight=0), accetta sempre
-        // Se entrambe sono definite, richiedi cos(theta) > 0.5 (theta < 60°)
-        if (vn_mag > 1e-6f && nn_mag > 1e-6f)
-        {
-            float cos_angle = normal_dot / (vn_mag * nn_mag);
-            if (cos_angle < 0.5f)
-            {
-                continue; // Scarta questo nodo
-            }
-        }
 
         if (dist2 < best_dist[K_NEIGHBORS - 1])
         {

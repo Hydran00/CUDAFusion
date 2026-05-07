@@ -101,7 +101,9 @@ __global__ void tsdf_integrate_kernel(
     const float *voxel_knn_w,
     const int *voxel_opt_counts,
     int min_opt_count,
-    bool use_warp)
+    bool use_warp,
+    float decay_alpha,
+    float max_weight)
 {
     int vx = blockIdx.x * blockDim.x + threadIdx.x;
     int vy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -155,13 +157,20 @@ __global__ void tsdf_integrate_kernel(
 
     float tsdf = fminf(1.f, sdf / truncation);
 
-    // Aggiornamento running average (KinectFusion style)
+    // Aggiornamento con DECAY per supportare scene dinamiche
     TSDFVoxel &voxel = voxels[voxel_idx];
-    float w_new = 1.f;
+    float w_obs = 1.f;
     float w_old = voxel.weight;
 
-    voxel.tsdf = (w_old * voxel.tsdf + w_new * tsdf) / (w_old + w_new);
-    voxel.weight = fminf(w_old + w_new, 100.f); // cap weight
+    // Decadimento del peso precedente
+    float decayed_w = w_old * decay_alpha;
+    float new_w = decayed_w + w_obs;
+
+    // Running weighted average con decadimento
+    voxel.tsdf = (voxel.tsdf * decayed_w + tsdf * w_obs) / new_w;
+
+    // Limite al peso massimo per mantenere reattività
+    voxel.weight = fminf(new_w, max_weight);
 }
 
 // ─────────────────────────────────────────────

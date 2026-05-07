@@ -14,6 +14,7 @@ find_package(CUDAToolkit REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(Open3D REQUIRED HINTS /home/hydran00/Open3D/lib/cmake/Open3D)
+find_package(OpenMP)
 include(FetchContent)
 
 message(STATUS "Open3D include dirs: ${Open3D_INCLUDE_DIRS}")
@@ -54,11 +55,12 @@ target_link_libraries(dfusion
     yaml-cpp::yaml-cpp
     Open3D::Open3D
 )
-
-# Main executable
 add_executable(run_fusion tests/main.cu)
 set_target_properties(run_fusion PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(run_fusion PRIVATE dfusion Open3D::Open3D cudasift_lib)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(run_fusion PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 # ─────────────────────────────────────────────────────────────────
 # UNIT TESTS (Atomic component testing)

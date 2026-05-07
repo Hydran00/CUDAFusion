@@ -12,6 +12,10 @@
 #include <memory>
 #include <opencv2/opencv.hpp>
 #include <vector>
+#include <atomic>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "cudaImage.h"
 #include "cudaSift.h"
@@ -197,14 +201,14 @@ public:
             std::chrono::high_resolution_clock::now() - t_normals)
             .count();
 
-    if (do_dbg)
-    {
-      std::vector<float3> h_n;
-      d_depth_normals_.download(h_n);
-      cv::imshow("2_depth_normals",
-                 dbg_normals(h_n, params_.cam.width, params_.cam.height));
-      cv::waitKey(1);
-    }
+    // if (do_dbg)
+    // {
+    std::vector<float3> h_n;
+    d_depth_normals_.download(h_n);
+    cv::imshow("2_depth_normals",
+               dbg_normals(h_n, params_.cam.width, params_.cam.height));
+    cv::waitKey(1);
+    // }
 
     if (frame_count_ == 0)
     {
@@ -248,7 +252,7 @@ public:
           auto h_nodes = warp_field_->download_nodes();
           auto h_transforms = warp_field_->download_transforms();
           cv::imshow(
-              "3_live_surface",
+              "3_live_surface_graph",
               dbg_verts(h_v, params_.cam, inverse_rigid_host(camera_pose_),
                         &h_nodes, &h_transforms));
           cv::waitKey(1);
@@ -320,14 +324,68 @@ public:
 
         if (num_corrs < params_.min_valid_corrs)
           break;
+        double base_rmse = correspondence_rmse();
 
         // 5. Ottimizzazione Gauss-Newton
+        // Minimal diagnostic instrumentation: when debug_vis is enabled,
+        // download a sample of correspondences and compute CPU RMSE before
+        // the solver, then download delta_x after the solver.
+        if (params_.debug_vis && gn == 0)
+        {
+          std::vector<Correspondence> h_c;
+          d_corrs_.download(h_c);
+          size_t valid_cnt = 0;
+          double sumw = 0.0;
+          double sumsq = 0.0;
+          for (size_t i = 0; i < h_c.size(); ++i)
+          {
+            const auto &c = h_c[i];
+            if (!c.valid)
+              continue;
+            valid_cnt++;
+            double r = (double)(c.dst.x - c.src.x) * c.normal.x +
+                       (double)(c.dst.y - c.src.y) * c.normal.y +
+                       (double)(c.dst.z - c.src.z) * c.normal.z;
+            sumw += c.weight;
+            sumsq += r * r;
+            if (valid_cnt <= 8)
+            {
+              printf("[DIAG corr %zu] src=(%.6e,%.6e,%.6e) dst=(%.6e,%.6e,%.6e) n=(%.6e,%.6e,%.6e) r=%.6e w=%.6e\n",
+                     valid_cnt,
+                     (double)c.src.x, (double)c.src.y, (double)c.src.z,
+                     (double)c.dst.x, (double)c.dst.y, (double)c.dst.z,
+                     (double)c.normal.x, (double)c.normal.y, (double)c.normal.z,
+                     r, (double)c.weight);
+            }
+          }
+          double cpu_rmse = valid_cnt ? std::sqrt(sumsq / (double)valid_cnt)
+                                      : 0.0;
+          printf("[DIAG corrs] valid=%zu sumw=%.6e cpu_rmse=%.6e\n",
+                 valid_cnt, sumw, cpu_rmse);
+        }
+
         auto t_solve = std::chrono::high_resolution_clock::now();
         solver_->solve(d_corrs_, (int)d_corrs_.size(),
                        warp_field_->device_nodes(),
                        warp_field_->device_transforms(),
                        warp_field_->num_nodes(), d_delta_x_);
         tracking_profile.solve_ms += elapsed_ms(t_solve);
+
+        if (params_.debug_vis && gn == 0)
+        {
+          std::vector<float> h_dx;
+          d_delta_x_.download(h_dx);
+          int n_dx = (int)h_dx.size();
+          double dx_norm = 0.0;
+          for (int i = 0; i < n_dx; ++i)
+            dx_norm += (double)h_dx[i] * (double)h_dx[i];
+          dx_norm = std::sqrt(dx_norm);
+          printf("[DIAG solver] delta_x_norm=%.6e first3=%.6e %.6e %.6e\n",
+                 dx_norm,
+                 (double)(n_dx > 0 ? h_dx[0] : 0.0f),
+                 (double)(n_dx > 1 ? h_dx[1] : 0.0f),
+                 (double)(n_dx > 2 ? h_dx[2] : 0.0f));
+        }
 
         // 6. Valida incremento prima di applicarlo.
         {
@@ -416,12 +474,66 @@ public:
         // ---- APPLY SOLO SE OK ----
         if (iter_ok)
         {
+          if (params_.update_scale <= 0.0f || !std::isfinite(base_rmse))
+            break;
+
           warp_field_->save_transforms();
+          float trial_scales[] = {params_.update_scale,
+                                  0.5f * params_.update_scale,
+                                  0.25f * params_.update_scale,
+                                  -params_.update_scale,
+                                  -0.5f * params_.update_scale,
+                                  -0.25f * params_.update_scale};
+          float best_scale = 0.0f;
+          double best_rmse = base_rmse;
+
+          for (float trial_scale : trial_scales)
+          {
+            warp_field_->restore_transforms();
+            auto t_apply = std::chrono::high_resolution_clock::now();
+            upload_scaled_delta_x(trial_scale);
+            warp_field_->apply_twist_increment(
+                d_delta_x_trial_, params_.max_update_rot,
+                params_.max_update_trans, 1.0f);
+            tracking_profile.apply_ms += elapsed_ms(t_apply);
+
+            rasterize_deformed_mesh_live_surface(do_profile ? &tracking_profile
+                                                            : nullptr);
+            if (params_.bbox.enabled)
+            {
+              auto t_bbox = std::chrono::high_resolution_clock::now();
+              apply_bbox_filter(d_vertices_live_);
+              profile_bbox_ms +=
+                  std::chrono::duration<double, std::milli>(
+                      std::chrono::high_resolution_clock::now() - t_bbox)
+                      .count();
+            }
+
+            auto t_corr_check = std::chrono::high_resolution_clock::now();
+            int checked_corrs = find_correspondences(false, false);
+            tracking_profile.corr_ms += elapsed_ms(t_corr_check);
+            double checked_rmse = correspondence_rmse();
+
+            if (checked_corrs >= params_.min_valid_corrs &&
+                checked_corrs >= (int)(0.75f * (float)num_corrs) &&
+                std::isfinite(checked_rmse) && checked_rmse < best_rmse)
+            {
+              best_rmse = checked_rmse;
+              best_scale = trial_scale;
+            }
+          }
+
+          printf("[GN iter %d] base RMSE=%.6e, best RMSE=%.6e at scale %.6e\n",
+                 gn, base_rmse, best_rmse, (double)best_scale);
+          warp_field_->restore_transforms();
+          if (best_scale == 0.0f)
+            break;
 
           auto t_apply = std::chrono::high_resolution_clock::now();
-          warp_field_->apply_twist_increment(d_delta_x_, params_.max_update_rot,
-                                             params_.max_update_trans,
-                                             params_.update_scale);
+          upload_scaled_delta_x(best_scale);
+          warp_field_->apply_twist_increment(
+              d_delta_x_trial_, params_.max_update_rot,
+              params_.max_update_trans, 1.0f);
           tracking_profile.apply_ms += elapsed_ms(t_apply);
 
           rasterize_deformed_mesh_live_surface(do_profile ? &tracking_profile
@@ -435,20 +547,9 @@ public:
                     std::chrono::high_resolution_clock::now() - t_bbox)
                     .count();
           }
-
           auto t_corr_check = std::chrono::high_resolution_clock::now();
-          int checked_corrs = find_correspondences(false, false);
+          num_corrs = find_correspondences(false, false);
           tracking_profile.corr_ms += elapsed_ms(t_corr_check);
-
-          if (checked_corrs < params_.min_valid_corrs ||
-              checked_corrs < (int)(0.65f * (float)num_corrs))
-          {
-            warp_field_->restore_transforms();
-            iter_ok = false;
-            break;
-          }
-
-          num_corrs = checked_corrs;
           warp_update_ok = true;
         }
         else
@@ -560,6 +661,50 @@ public:
     mesh.PaintUniformColor({1.0, 1.0, 1.0});
   }
 
+  // Raycast the TSDF into a pointcloud (vertices + normals) and fill the
+  // provided Open3D PointCloud. This performs the per-pixel raycast used for
+  // smooth, trilinearly-interpolated normals (the "waxy" look).
+  void update_o3d_raycast_pointcloud(open3d::geometry::PointCloud &pc)
+  {
+    // Call TSDF raycast into device buffers (overwrites d_vertices_live_)
+    // Note: volume_->raycast allocates device arrays internally; we call the
+    // variant that writes into our preallocated device buffers.
+    // Use current camera pose and warp field transforms for warped-raycast.
+    // Prepare temporary host containers
+    int n_pixels = params_.cam.width * params_.cam.height;
+
+    // Raycast into device arrays
+    volume_->raycast(d_vertices_live_, d_normals_live_, params_.cam,
+                     camera_pose_, warp_field_->device_nodes(),
+                     warp_field_->device_transforms(), warp_field_->num_nodes(),
+                     d_voxel_knn_.data, d_voxel_knn_w_.data,
+                     d_hit_voxel_idx_.data);
+
+    // Download results
+    std::vector<float3> h_v;
+    std::vector<float3> h_n;
+    d_vertices_live_.download(h_v);
+    d_normals_live_.download(h_n);
+
+    pc.Clear();
+    pc.points_.reserve(n_pixels);
+    pc.normals_.reserve(n_pixels);
+
+    for (int i = 0; i < n_pixels; ++i)
+    {
+      float3 v = h_v[i];
+      float3 n = h_n[i];
+      // Skip invalid points (z==INF or default)
+      if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z))
+        continue;
+      pc.points_.push_back(Eigen::Vector3d(v.x, v.y, v.z));
+      pc.normals_.push_back(Eigen::Vector3d(n.x, n.y, n.z));
+    }
+    // normals were downloaded per-pixel; if any are missing we skip recompute
+    // (Open3D C++ uses EstimateNormals with search params; skip here).
+    pc.PaintUniformColor(Eigen::Vector3d(0.9, 0.9, 0.9));
+  }
+
   // Salva la mesh warped (live frame) come PLY
   // CPU skinning: per ogni vertice canonico, applica blend delle trasformazioni
   // nodi più vicini
@@ -623,6 +768,7 @@ private:
   DeviceArray<float3> d_normals_live_;
   DeviceArray<Correspondence> d_corrs_;
   DeviceArray<float> d_delta_x_;
+  DeviceArray<float> d_delta_x_trial_;
   DeviceArray<int> d_voxel_knn_;
   DeviceArray<float> d_voxel_knn_w_;
   DeviceArray<int> d_pixel_knn_;
@@ -892,7 +1038,10 @@ private:
     std::vector<float3> out_v(n_pixels, make_float3(0, 0, 0));
     std::vector<float3> out_n(n_pixels, make_float3(0, 0, 0));
     std::vector<int> out_vidx(n_pixels, -1);
-    std::vector<float> zbuf(n_pixels, std::numeric_limits<float>::infinity());
+    // Use atomic z-buffer for thread-safe parallel rasterization
+    std::vector<std::atomic<float>> zbuf(n_pixels);
+    for (int i = 0; i < n_pixels; ++i)
+      zbuf[i].store(std::numeric_limits<float>::infinity());
 
     std::vector<float3> warped(verts.size());
     auto t_skin = std::chrono::high_resolution_clock::now();
@@ -941,8 +1090,10 @@ private:
     };
 
     auto t_tri_raster = std::chrono::high_resolution_clock::now();
-    for (const auto &tri : tris)
+#pragma omp parallel for schedule(dynamic)
+    for (int tri_i = 0; tri_i < (int)tris.size(); ++tri_i)
     {
+      const auto &tri = tris[tri_i];
       int ids[3] = {tri.x, tri.y, tri.z};
       if (ids[0] < 0 || ids[1] < 0 || ids[2] < 0 ||
           ids[0] >= (int)verts.size() || ids[1] >= (int)verts.size() ||
@@ -993,20 +1144,32 @@ private:
             continue;
           float z = w0 * cc[0].z + w1 * cc[1].z + w2 * cc[2].z;
           int px = y * params_.cam.width + x;
-          if (z <= 0.0f || z >= zbuf[px])
+          if (z <= 0.0f)
             continue;
-          zbuf[px] = z;
-          out_v[px] = make_float3(w0 * wc[0].x + w1 * wc[1].x + w2 * wc[2].x,
-                                  w0 * wc[0].y + w1 * wc[1].y + w2 * wc[2].y,
-                                  w0 * wc[0].z + w1 * wc[1].z + w2 * wc[2].z);
-          out_n[px] = face_n;
-          float3 cp = make_float3(w0 * verts[ids[0]].x + w1 * verts[ids[1]].x +
-                                      w2 * verts[ids[2]].x,
-                                  w0 * verts[ids[0]].y + w1 * verts[ids[1]].y +
-                                      w2 * verts[ids[2]].y,
-                                  w0 * verts[ids[0]].z + w1 * verts[ids[1]].z +
-                                      w2 * verts[ids[2]].z);
-          out_vidx[px] = canonical_voxel_index(cp);
+
+          float cur = zbuf[px].load();
+          while (z < cur)
+          {
+            // try to atomically claim this pixel with a smaller depth
+            if (zbuf[px].compare_exchange_strong(cur, z))
+            {
+              // successful winner — write outputs (safe because only the
+              // winner writes to this pixel after successful swap)
+              out_v[px] = make_float3(w0 * wc[0].x + w1 * wc[1].x + w2 * wc[2].x,
+                                      w0 * wc[0].y + w1 * wc[1].y + w2 * wc[2].y,
+                                      w0 * wc[0].z + w1 * wc[1].z + w2 * wc[2].z);
+              out_n[px] = face_n;
+              float3 cp = make_float3(w0 * verts[ids[0]].x + w1 * verts[ids[1]].x +
+                                          w2 * verts[ids[2]].x,
+                                      w0 * verts[ids[0]].y + w1 * verts[ids[1]].y +
+                                          w2 * verts[ids[2]].y,
+                                      w0 * verts[ids[0]].z + w1 * verts[ids[1]].z +
+                                          w2 * verts[ids[2]].z);
+              out_vidx[px] = canonical_voxel_index(cp);
+              break;
+            }
+            // cur updated by compare_exchange_strong; loop retries if still larger
+          }
         }
       }
     }
@@ -1032,6 +1195,37 @@ private:
         d_corrs_.data, d_hit_voxel_idx_.data, n_pixels, params_.tsdf.dims,
         frame_count_, d_voxel_opt_counts_.data, d_voxel_opt_frame_.data);
     cudaDeviceSynchronize();
+  }
+
+  double correspondence_rmse() const
+  {
+    std::vector<Correspondence> h_corrs;
+    d_corrs_.download(h_corrs);
+    double sum = 0.0;
+    double wsum = 0.0;
+    for (const auto &c : h_corrs)
+    {
+      if (!c.valid || c.weight <= 0.0f)
+        continue;
+      float3 diff =
+          make_float3(c.src.x - c.dst.x, c.src.y - c.dst.y, c.src.z - c.dst.z);
+      double r = (double)c.normal.x * diff.x + (double)c.normal.y * diff.y +
+                 (double)c.normal.z * diff.z;
+      double w = std::max(0.0f, c.weight);
+      sum += w * r * r;
+      wsum += w;
+    }
+    return wsum > 0.0 ? std::sqrt(sum / wsum)
+                      : std::numeric_limits<double>::infinity();
+  }
+
+  void upload_scaled_delta_x(float scale)
+  {
+    std::vector<float> h_dx;
+    d_delta_x_.download(h_dx);
+    for (float &v : h_dx)
+      v *= scale;
+    d_delta_x_trial_.upload(h_dx);
   }
 
   struct SparseFeature

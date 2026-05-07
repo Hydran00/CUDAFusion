@@ -19,22 +19,24 @@ tsdf:
   voxel_size: 0.005
   truncation: 0.03
   origin: [-0.7, -0.7, 0.5]
+  decay_alpha: 0.80
+  max_weight: 50.0
 
 solver:
   gn_iterations: 2
-  pcg_iterations: 20   # ridotto da 400: evita over-optimization
-  lambda_smooth: 40.0 # arap
-  lambda_damping: 0.05 # aumentato per più regolarizzazione
-
+  pcg_iterations: 40   # ridotto da 400: evita over-optimization
+  lambda_smooth: 50.0 # arap
+  lambda_damping: 1.0 # aumentato per più regolarizzazione
+  debug: false
 warp:
-  node_radius: 0.03
+  node_radius: 0.04
   node_min_dist: 0.025
   max_nodes: 4096
   node_update_every_n: 5
   max_dx_mean: 0.2    # ridotto da 2.0: limita deformazioni locali
   max_update_rot: 0.12  # ~7°, prevenire salti grandi
   max_update_trans: 0.04  # 4cm, contenere step size
-  update_scale: 0.08  # ridotto da 0.1: step più piccoli
+  update_scale: 0.1  # ridotto da 0.1: step più piccoli
   integrate_warped: true
   integrate_min_optimized_count: 1
   integrate_unwarped_fallback: false

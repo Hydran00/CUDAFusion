@@ -1,5 +1,6 @@
 #include "solver.h"
 #include "se3_math.cuh"
+#include <cstdio>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <algorithm>
@@ -26,9 +27,19 @@ __device__ int find_block(
     const int *row_ptr,
     const int *col_idx)
 {
-    for (int r = row_ptr[row]; r < row_ptr[row + 1]; r++)
-        if (col_idx[r] == col)
-            return r;
+    int lo = row_ptr[row];
+    int hi = row_ptr[row + 1] - 1;
+    while (lo <= hi)
+    {
+        int mid = (lo + hi) >> 1;
+        int v = col_idx[mid];
+        if (v == col)
+            return mid;
+        if (v < col)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
     return -1;
 }
 
@@ -170,7 +181,11 @@ __global__ void add_diagonal_damping_kernel(
 
     float *diag = A_values + blk * BLOCK_SIZE;
     for (int k = 0; k < BLOCK_DIM; k++)
-        diag[k * BLOCK_DIM + k] += lambda;
+    {
+        float current_diag = diag[k * BLOCK_DIM + k];
+        diag[k * BLOCK_DIM + k] = current_diag + lambda * (current_diag + 1.0f);
+    }
+    // diag[k * BLOCK_DIM + k] += lambda;
 }
 
 // ─────────────────────────────────────────────
@@ -194,11 +209,18 @@ __global__ void assemble_smooth_term_kernel(
         return;
 
     const DeformNode &node_i = nodes[ni];
+    // Delta per Huber sullo smoothness: es. 5cm.
+    // Se un arco si allunga più di così, il suo contributo viene smorzato.
+    const float huber_smooth_delta = 0.05f;
 
     for (int k = 0; k < node_i.num_neighbors; k++)
     {
         int nj = node_i.neighbors[k];
         if (nj < 0 || nj >= num_nodes)
+            continue;
+
+        // Processiamo ogni arco non orientato una sola volta per coppia
+        if (nj <= ni)
             continue;
 
         float3 xj = nodes[nj].pos;
@@ -210,6 +232,13 @@ __global__ void assemble_smooth_term_kernel(
             Ti_xj.x - Tj_xj.x,
             Ti_xj.y - Tj_xj.y,
             Ti_xj.z - Tj_xj.z);
+
+        // Calcolo della norma del residuo ARAP per questo arco
+        float r_norm = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z);
+
+        // Calcolo del peso di Huber per lo smoothness
+        float huber_w = compute_huber_weight(r_norm, huber_smooth_delta);
+        float effective_lambda = lambda * huber_w;
 
         float Ji[6][3], Jj[6][3];
 
@@ -228,6 +257,8 @@ __global__ void assemble_smooth_term_kernel(
         int ij = find_block(ni, nj, row_ptr, col_idx);
         int ji = find_block(nj, ni, row_ptr, col_idx);
 
+        // Utilizziamo effective_lambda invece del lambda fisso per pesare i contributi
+
         // --- A(ii) ---
         if (ii >= 0)
             for (int a = 0; a < 6; a++)
@@ -236,7 +267,7 @@ __global__ void assemble_smooth_term_kernel(
                     float v = 0;
                     for (int c = 0; c < 3; c++)
                         v += Ji[a][c] * Ji[b][c];
-                    atomicAdd(&A_values[ii * 36 + a * 6 + b], lambda * v);
+                    atomicAdd(&A_values[ii * 36 + a * 6 + b], effective_lambda * v);
                 }
 
         // --- A(jj) ---
@@ -247,7 +278,7 @@ __global__ void assemble_smooth_term_kernel(
                     float v = 0;
                     for (int c = 0; c < 3; c++)
                         v += Jj[a][c] * Jj[b][c];
-                    atomicAdd(&A_values[jj * 36 + a * 6 + b], lambda * v);
+                    atomicAdd(&A_values[jj * 36 + a * 6 + b], effective_lambda * v);
                 }
 
         // --- A(ij) ---
@@ -258,7 +289,7 @@ __global__ void assemble_smooth_term_kernel(
                     float v = 0;
                     for (int c = 0; c < 3; c++)
                         v += Ji[a][c] * Jj[b][c];
-                    atomicAdd(&A_values[ij * 36 + a * 6 + b], -lambda * v);
+                    atomicAdd(&A_values[ij * 36 + a * 6 + b], -effective_lambda * v);
                 }
 
         // --- A(ji) ---
@@ -269,10 +300,10 @@ __global__ void assemble_smooth_term_kernel(
                     float v = 0;
                     for (int c = 0; c < 3; c++)
                         v += Jj[a][c] * Ji[b][c];
-                    atomicAdd(&A_values[ji * 36 + a * 6 + b], -lambda * v);
+                    atomicAdd(&A_values[ji * 36 + a * 6 + b], -effective_lambda * v);
                 }
 
-        // --- RHS ---
+        // --- RHS (b) ---
         float r_arr[3] = {r.x, r.y, r.z};
 
         for (int a = 0; a < 6; a++)
@@ -283,12 +314,11 @@ __global__ void assemble_smooth_term_kernel(
                 vi += Ji[a][c] * r_arr[c];
                 vj += Jj[a][c] * r_arr[c];
             }
-            atomicAdd(&b_values[ni * 6 + a], -lambda * vi);
-            atomicAdd(&b_values[nj * 6 + a], lambda * vj);
+            atomicAdd(&b_values[ni * 6 + a], -effective_lambda * vi);
+            atomicAdd(&b_values[nj * 6 + a], effective_lambda * vj);
         }
     }
 }
-
 // ─────────────────────────────────────────────
 //  Kernel: precondizionatore block-diagonale
 //  Inverte ogni blocco diagonale 6x6
@@ -326,10 +356,11 @@ __global__ void compute_preconditioner_kernel(
     if (!invert6x6_cholesky(diag, inv))
     {
         // Fallback: precondizionatore diagonale semplice
+        const float eps = 1e-6f;
         for (int k = 0; k < 36; k++)
-            inv[k] = 0;
+            inv[k] = 0.f;
         for (int k = 0; k < 6; k++)
-            inv[k * 6 + k] = (diag[k * 6 + k] > 1e-8f) ? 1.f / diag[k * 6 + k] : 1.f;
+            inv[k * 6 + k] = 1.f / (diag[k * 6 + k] + eps);
     }
 
     for (int k = 0; k < 36; k++)
@@ -350,24 +381,22 @@ __global__ void bsr_spmv_kernel(
     int num_nodes)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (gid >= num_nodes * 6)
+    int N = num_nodes * BLOCK_DIM;
+    if (gid >= N)
         return;
 
-    int ni = gid / 6;
-    int row = gid % 6;
+    int ni = gid / BLOCK_DIM;
+    int row = gid % BLOCK_DIM;
 
     float sum = 0.0f;
-
     for (int b = row_ptr[ni]; b < row_ptr[ni + 1]; b++)
     {
         int nj = col_idx[b];
-        const float *blk = A_values + b * 36;
-        const float *xj = x + nj * 6;
-
-        for (int c = 0; c < 6; c++)
-            sum += blk[row * 6 + c] * xj[c];
+        const float *blk = A_values + b * BLOCK_SIZE;
+        const float *xj = x + nj * BLOCK_DIM;
+        for (int c = 0; c < BLOCK_DIM; c++)
+            sum += blk[row * BLOCK_DIM + c] * xj[c];
     }
-
     y[gid] = sum;
 }
 
@@ -428,7 +457,6 @@ GaussNewtonSolver::GaussNewtonSolver(const Params &p, int max_nodes)
 {
     int n6 = max_nodes * BLOCK_DIM;
     b_.allocate(n6);
-    x_.allocate(n6);
     r_.allocate(n6);
     z_.allocate(n6);
     p_.allocate(n6);
@@ -491,11 +519,15 @@ void GaussNewtonSolver::solve(
 {
     delta_x.allocate(num_nodes * BLOCK_DIM);
 
-    // Download nodes to CPU to build sparsity pattern
-    std::vector<DeformNode> h_nodes(num_nodes);
-    cudaMemcpy(h_nodes.data(), d_nodes,
-               num_nodes * sizeof(DeformNode), cudaMemcpyDeviceToHost);
-    build_sparsity_pattern(h_nodes.data(), num_nodes);
+    // Build sparsity pattern only when topology (num_nodes) changes
+    if (num_nodes != last_num_nodes_)
+    {
+        std::vector<DeformNode> h_nodes(num_nodes);
+        cudaMemcpy(h_nodes.data(), d_nodes,
+                   num_nodes * sizeof(DeformNode), cudaMemcpyDeviceToHost);
+        build_sparsity_pattern(h_nodes.data(), num_nodes);
+        last_num_nodes_ = num_nodes;
+    }
 
     // One linearization per frame. Repeating this loop without applying the
     // update and re-raycasting solves the same system again and can only waste
@@ -523,7 +555,7 @@ void GaussNewtonSolver::assemble_system(
     assemble_data_term_kernel<<<grid, block>>>(
         corrs.data, num_corrs, d_nodes, d_transforms,
         A_.values.data, b_.data,
-        A_.row_ptr.data, A_.col_idx.data, num_nodes, 0.1f /*huber delta*/);
+        A_.row_ptr.data, A_.col_idx.data, num_nodes, 0.05f /*huber delta*/);
 
     // Smoothness term
     int grid_nodes = (num_nodes + block - 1) / block;
@@ -554,8 +586,11 @@ float GaussNewtonSolver::pcg_solve(int num_nodes, DeviceArray<float> &x_out)
 {
     int n = num_nodes * BLOCK_DIM;
 
-    // r = b - A*x  (x=0 → r=b)
-    cudaMemcpy(r_.data, b_.data, n * sizeof(float), cudaMemcpyDeviceToDevice);
+    // r = b - A*x  (robust for non-zero initial x_out)
+    // Ap_ used as temporary: Ap_ = A * x_out
+    bsr_spmv(A_, x_out, Ap_, num_nodes);                                       // Ap_ = A*x_out
+    cudaMemcpy(r_.data, b_.data, n * sizeof(float), cudaMemcpyDeviceToDevice); // r_ = b
+    axpy(-1.f, Ap_, r_, n);                                                    // r = b - A*x_out
 
     // z = M⁻¹ r
     apply_preconditioner(r_, z_, num_nodes);
@@ -564,8 +599,14 @@ float GaussNewtonSolver::pcg_solve(int num_nodes, DeviceArray<float> &x_out)
     cudaMemcpy(p_.data, z_.data, n * sizeof(float), cudaMemcpyDeviceToDevice);
 
     float rz_old = dot(r_, z_, n);
-    float final_residual = sqrtf(rz_old);
-
+    // optional debug: print initial norms and PCG settings
+    if (params_.debug)
+    {
+        float bnorm = sqrtf(dot(b_, b_, n));
+        printf("[PCG] start nodes=%d n=%d ||b||=%e rz_old=%e tol=%e maxit=%d\n",
+               num_nodes, n, bnorm, rz_old, params_.pcg_tolerance, params_.pcg_iterations);
+    }
+    int iter_used = 0;
     for (int iter = 0; iter < params_.pcg_iterations; iter++)
     {
         // Ap = A * p
@@ -573,7 +614,12 @@ float GaussNewtonSolver::pcg_solve(int num_nodes, DeviceArray<float> &x_out)
 
         float pAp = dot(p_, Ap_, n);
         if (fabsf(pAp) < 1e-12f)
+        {
+            if (params_.debug)
+                printf("[PCG] break: pAp too small (%e) at iter %d\n", pAp, iter);
+            iter_used = iter;
             break;
+        }
         float alpha = rz_old / pAp;
 
         // x = x + alpha * p
@@ -583,7 +629,12 @@ float GaussNewtonSolver::pcg_solve(int num_nodes, DeviceArray<float> &x_out)
         axpy(-alpha, Ap_, r_, n);
 
         float r_norm = sqrtf(dot(r_, r_, n));
-        final_residual = r_norm;
+        if (params_.debug)
+        {
+            printf("[PCG] iter %d: r_norm=%e rz=%e pAp=%e alpha=%e\n",
+                   iter, r_norm, rz_old, pAp, alpha);
+        }
+        iter_used = iter + 1;
         if (r_norm < params_.pcg_tolerance)
             break;
 
@@ -598,7 +649,10 @@ float GaussNewtonSolver::pcg_solve(int num_nodes, DeviceArray<float> &x_out)
 
         rz_old = rz_new;
     }
-    return final_residual;
+    float final_r = sqrtf(dot(r_, r_, n));
+    if (params_.debug)
+        printf("[PCG] end: iters=%d final_r=%e\n", iter_used, final_r);
+    return final_r;
 }
 
 void GaussNewtonSolver::bsr_spmv(
@@ -607,8 +661,10 @@ void GaussNewtonSolver::bsr_spmv(
     DeviceArray<float> &y,
     int num_nodes)
 {
-    // Un blocco CUDA per node-row, BLOCK_DIM thread per blocco
-    bsr_spmv_kernel<<<num_nodes, BLOCK_DIM>>>(
+    int n = num_nodes * BLOCK_DIM;
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    bsr_spmv_kernel<<<grid, block>>>(
         A.values.data, A.row_ptr.data, A.col_idx.data,
         x.data, y.data, num_nodes);
     cudaDeviceSynchronize();
@@ -632,7 +688,7 @@ float GaussNewtonSolver::dot(
 {
     thrust::device_ptr<const float> pa(a.data);
     thrust::device_ptr<const float> pb(b.data);
-    return thrust::inner_product(pa, pa + n, pb, 0.0f);
+    return thrust::inner_product(pa, pa + n, pb, 0.f);
 }
 
 void GaussNewtonSolver::axpy(float alpha, const DeviceArray<float> &x,

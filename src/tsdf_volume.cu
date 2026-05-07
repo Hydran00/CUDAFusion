@@ -8,7 +8,8 @@
 //  TSDFVolume
 // ─────────────────────────────────────────────
 
-TSDFVolume::TSDFVolume(const Params& p) : params_(p) {
+TSDFVolume::TSDFVolume(const Params &p) : params_(p)
+{
   int total = p.dims.x * p.dims.y * p.dims.z;
   d_voxels_.allocate(total);
 
@@ -19,14 +20,15 @@ TSDFVolume::TSDFVolume(const Params& p) : params_(p) {
 
 TSDFVolume::~TSDFVolume() {}
 
-void TSDFVolume::integrate(const DeviceArray<float>& depth,
-                           const DeviceArray<float3>& normals,
-                           const CameraIntrinsics& cam, const Mat4& camera_pose,
-                           const DeformNode* nodes, const DualQuat* transforms,
-                           int num_nodes, const int* voxel_knn,
-                           const float* voxel_knn_w,
-                           const int* voxel_opt_counts,
-                           int min_opt_count) {
+void TSDFVolume::integrate(const DeviceArray<float> &depth,
+                           const DeviceArray<float3> &normals,
+                           const CameraIntrinsics &cam, const Mat4 &camera_pose,
+                           const DeformNode *nodes, const DualQuat *transforms,
+                           int num_nodes, const int *voxel_knn,
+                           const float *voxel_knn_w,
+                           const int *voxel_opt_counts,
+                           int min_opt_count)
+{
   bool use_warp = (nodes != nullptr && num_nodes > 0);
 
   // T_cam_world = inversa di camera_pose (world→camera)
@@ -34,7 +36,7 @@ void TSDFVolume::integrate(const DeviceArray<float>& depth,
   Mat4 T_cam_world;
   for (int i = 0; i < 3; i++)
     for (int j = 0; j < 3; j++)
-      T_cam_world.m[i][j] = camera_pose.m[j][i];  // trasposizione R
+      T_cam_world.m[i][j] = camera_pose.m[j][i]; // trasposizione R
   // traslazione: -R^T * t
   T_cam_world.m[0][3] = -(T_cam_world.m[0][0] * camera_pose.m[0][3] +
                           T_cam_world.m[0][1] * camera_pose.m[1][3] +
@@ -55,18 +57,19 @@ void TSDFVolume::integrate(const DeviceArray<float>& depth,
       d_voxels_.data, params_.dims, params_.origin, params_.voxel_size,
       params_.truncation, depth.data, cam.width, cam.height, cam, T_cam_world,
       nodes, transforms, num_nodes, voxel_knn, voxel_knn_w, voxel_opt_counts,
-      min_opt_count, use_warp);
+      min_opt_count, use_warp, params_.decay_alpha, params_.max_weight);
 
   cudaDeviceSynchronize();
 }
 
-void TSDFVolume::raycast(DeviceArray<float3>& vertices,
-                         DeviceArray<float3>& normals,
-                         const CameraIntrinsics& cam, const Mat4& camera_pose,
-                         const DeformNode* nodes, const DualQuat* transforms,
-                         int num_nodes, const int* voxel_knn,
-                         const float* voxel_knn_w,
-                         int* out_canonical_vidx) {
+void TSDFVolume::raycast(DeviceArray<float3> &vertices,
+                         DeviceArray<float3> &normals,
+                         const CameraIntrinsics &cam, const Mat4 &camera_pose,
+                         const DeformNode *nodes, const DualQuat *transforms,
+                         int num_nodes, const int *voxel_knn,
+                         const float *voxel_knn_w,
+                         int *out_canonical_vidx)
+{
   int n_pixels = cam.width * cam.height;
   vertices.allocate(n_pixels);
   normals.allocate(n_pixels);
@@ -85,4 +88,3 @@ void TSDFVolume::raycast(DeviceArray<float3>& vertices,
 
   cudaDeviceSynchronize();
 }
-

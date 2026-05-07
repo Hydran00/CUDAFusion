@@ -271,6 +271,7 @@ int main(int argc, char **argv)
 
   std::shared_ptr<open3d::visualization::Visualizer> vis;
   std::shared_ptr<open3d::geometry::TriangleMesh> vis_mesh;
+  std::shared_ptr<open3d::geometry::PointCloud> vis_pc;
 
   if (app.use_vis)
   {
@@ -280,6 +281,7 @@ int main(int argc, char **argv)
     vis->GetRenderOption().mesh_show_back_face_ = true;
 
     vis_mesh = std::make_shared<open3d::geometry::TriangleMesh>();
+    vis_pc = std::make_shared<open3d::geometry::PointCloud>();
 
     auto ref_frame = open3d::geometry::TriangleMesh::CreateCoordinateFrame(0.3);
     vis->AddGeometry(ref_frame);
@@ -337,19 +339,17 @@ int main(int argc, char **argv)
       auto vis_t0 = std::chrono::high_resolution_clock::now();
       if (frame_idx == 1)
       {
-        pipeline.update_o3d_mesh(*vis_mesh);
-        vis->AddGeometry(vis_mesh);
+        // Use raycast pointcloud visualization by default (faster, smooth normals)
+        pipeline.update_o3d_raycast_pointcloud(*vis_pc);
+        vis->AddGeometry(vis_pc);
         if (!app.quiet)
-        {
-          std::cout << "[vis] initial mesh | vertices=" << vis_mesh->vertices_.size()
-                    << " triangles=" << vis_mesh->triangles_.size() << "\n";
-        }
+          std::cout << "[vis] initial raycast pointcloud | points=" << vis_pc->points_.size() << "\n";
       }
 
       if (frame_idx > 1)
       {
-        pipeline.update_o3d_mesh(*vis_mesh);
-        vis->UpdateGeometry(vis_mesh);
+        pipeline.update_o3d_raycast_pointcloud(*vis_pc);
+        vis->UpdateGeometry(vis_pc);
       }
 
       vis->GetViewControl().SetFront({0.14, -0.25, -0.96});
