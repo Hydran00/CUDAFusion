@@ -22,6 +22,7 @@
 #include "depth_sequence.h"
 #include "fusion_debug.h"
 #include "fusion_math.h"
+#include "mesh_raster_kernels.h"
 #include "skinning_kernels.h"
 #include "solver.h"
 #include "tsdf_kernels.h"
@@ -215,6 +216,7 @@ public:
       // Primo frame: solo integra
       auto t_integrate = std::chrono::high_resolution_clock::now();
       volume_->integrate(d_depth_, d_depth_normals_, params_.cam, camera_pose_);
+      surface_mesh_cache_valid_ = false;
       last_frame_integrated_ = true;
       profile_initial_integrate_ms =
           std::chrono::duration<double, std::milli>(
@@ -575,6 +577,7 @@ public:
               warp_field_->device_nodes(), warp_field_->device_transforms(),
               warp_field_->num_nodes(), d_voxel_knn_.data, d_voxel_knn_w_.data,
               d_voxel_opt_counts_.data, params_.integrate_min_optimized_count);
+          surface_mesh_cache_valid_ = false;
           last_frame_integrated_ = true;
         }
       }
@@ -582,6 +585,7 @@ public:
       {
         volume_->integrate(d_depth_, d_depth_normals_, params_.cam,
                            camera_pose_);
+        surface_mesh_cache_valid_ = false;
         last_frame_integrated_ = true;
       }
       profile_fusion_ms =
@@ -780,9 +784,12 @@ private:
   DeviceArray<int> d_voxel_opt_frame_;
   DeviceArray<float3> d_mesh_vertices_;
   DeviceArray<float3> d_mesh_warped_;
+  DeviceArray<int3> d_mesh_triangles_;
+  DeviceArray<unsigned long long> d_raster_ztri_;
 
   Mat4 camera_pose_;
   bool last_frame_integrated_ = false;
+  bool surface_mesh_cache_valid_ = false;
   cv::Mat current_color_gray_;
   std::deque<std::unique_ptr<SiftFeatureFrame>> sift_history_;
 
@@ -1027,50 +1034,64 @@ private:
   void rasterize_deformed_mesh_live_surface(TrackingProfile *profile = nullptr)
   {
     auto t_total = std::chrono::high_resolution_clock::now();
-    std::vector<float3> verts, norms;
-    std::vector<int3> tris;
-    auto t_mc = std::chrono::high_resolution_clock::now();
-    volume_->extract_surface(verts, norms, tris);
-    if (profile)
-      profile->mc_ms += elapsed_ms(t_mc);
+    if (!surface_mesh_cache_valid_)
+    {
+      auto t_mc = std::chrono::high_resolution_clock::now();
+      volume_->extract_surface_device(d_mesh_vertices_, d_mesh_triangles_);
+      surface_mesh_cache_valid_ = true;
+      if (profile)
+        profile->mc_ms += elapsed_ms(t_mc);
+    }
+    int num_vertices = (int)d_mesh_vertices_.size();
+    int num_triangles = (int)d_mesh_triangles_.size();
 
     int n_pixels = params_.cam.width * params_.cam.height;
-    std::vector<float3> out_v(n_pixels, make_float3(0, 0, 0));
-    std::vector<float3> out_n(n_pixels, make_float3(0, 0, 0));
-    std::vector<int> out_vidx(n_pixels, -1);
-    // Use atomic z-buffer for thread-safe parallel rasterization
-    std::vector<std::atomic<float>> zbuf(n_pixels);
-    for (int i = 0; i < n_pixels; ++i)
-      zbuf[i].store(std::numeric_limits<float>::infinity());
+    d_vertices_live_.zero();
+    d_normals_live_.zero();
+    CUDA_CHECK(cudaMemset(d_hit_voxel_idx_.data, 0xff,
+                          d_hit_voxel_idx_.bytes()));
 
-    std::vector<float3> warped(verts.size());
+    if (num_vertices <= 0 || num_triangles <= 0)
+    {
+      if (profile)
+      {
+        profile->raster_total_ms += elapsed_ms(t_total);
+        profile->raster_calls++;
+      }
+      return;
+    }
+
+    if (d_mesh_warped_.size() != d_mesh_vertices_.size())
+      d_mesh_warped_.allocate(d_mesh_vertices_.size());
+
     auto t_skin = std::chrono::high_resolution_clock::now();
     int total_voxels =
         params_.tsdf.dims.x * params_.tsdf.dims.y * params_.tsdf.dims.z;
     bool can_skin_on_gpu =
-        !verts.empty() && warp_field_->num_nodes() > 0 &&
+        num_vertices > 0 && warp_field_->num_nodes() > 0 &&
         d_voxel_knn_.size() == (size_t)total_voxels * K_NEIGHBORS &&
         d_voxel_knn_w_.size() == (size_t)total_voxels * K_NEIGHBORS;
     if (can_skin_on_gpu)
     {
-      d_mesh_vertices_.upload(verts);
-      if (d_mesh_warped_.size() != verts.size())
-        d_mesh_warped_.allocate(verts.size());
-      skin_vertices_from_voxel_knn_kernel<<<grid1d((int)verts.size()), 256>>>(
-          d_mesh_vertices_.data, d_mesh_warped_.data, (int)verts.size(),
+      skin_vertices_from_voxel_knn_kernel<<<grid1d(num_vertices), 256>>>(
+          d_mesh_vertices_.data, d_mesh_warped_.data, num_vertices,
           params_.tsdf.origin, params_.tsdf.voxel_size, params_.tsdf.dims,
           warp_field_->device_nodes(), warp_field_->device_transforms(),
           warp_field_->num_nodes(), d_voxel_knn_.data, d_voxel_knn_w_.data);
       CUDA_CHECK(cudaGetLastError());
       CUDA_CHECK(cudaDeviceSynchronize());
-      d_mesh_warped_.download(warped);
     }
     else if (warp_field_->num_nodes() == 0)
     {
-      warped = verts;
+      CUDA_CHECK(cudaMemcpy(d_mesh_warped_.data, d_mesh_vertices_.data,
+                            d_mesh_vertices_.bytes(),
+                            cudaMemcpyDeviceToDevice));
     }
     else
     {
+      std::vector<float3> verts;
+      d_mesh_vertices_.download(verts);
+      std::vector<float3> warped(verts.size());
       auto h_nodes = warp_field_->download_nodes();
       auto h_transforms = warp_field_->download_transforms();
       for (size_t i = 0; i < verts.size(); i++)
@@ -1079,107 +1100,35 @@ private:
         float ws[K_NEIGHBORS];
         skin_point_host(verts[i], h_nodes, h_transforms, warped[i], ids, ws);
       }
+      d_mesh_warped_.upload(warped);
     }
     if (profile)
       profile->skin_ms += elapsed_ms(t_skin);
 
     Mat4 T_cam_world = inverse_rigid_host(camera_pose_);
-    auto edge = [](float2 a, float2 b, float2 p)
-    {
-      return (p.x - a.x) * (b.y - a.y) - (p.y - a.y) * (b.x - a.x);
-    };
 
     auto t_tri_raster = std::chrono::high_resolution_clock::now();
-#pragma omp parallel for schedule(dynamic)
-    for (int tri_i = 0; tri_i < (int)tris.size(); ++tri_i)
-    {
-      const auto &tri = tris[tri_i];
-      int ids[3] = {tri.x, tri.y, tri.z};
-      if (ids[0] < 0 || ids[1] < 0 || ids[2] < 0 ||
-          ids[0] >= (int)verts.size() || ids[1] >= (int)verts.size() ||
-          ids[2] >= (int)verts.size())
-        continue;
+    if (d_raster_ztri_.size() != (size_t)n_pixels)
+      d_raster_ztri_.allocate(n_pixels);
+    CUDA_CHECK(cudaMemset(d_raster_ztri_.data, 0xff, d_raster_ztri_.bytes()));
 
-      float3 wc[3] = {warped[ids[0]], warped[ids[1]], warped[ids[2]]};
-      float3 cc[3] = {T_cam_world.transform_point(wc[0]),
-                      T_cam_world.transform_point(wc[1]),
-                      T_cam_world.transform_point(wc[2])};
-      if (cc[0].z <= 0.0f || cc[1].z <= 0.0f || cc[2].z <= 0.0f)
-        continue;
+    rasterize_triangles_z_kernel<<<grid1d(num_triangles), 256>>>(
+        d_mesh_vertices_.data, d_mesh_warped_.data, d_mesh_triangles_.data,
+        num_vertices, num_triangles, params_.cam, T_cam_world,
+        d_raster_ztri_.data);
+    CUDA_CHECK(cudaGetLastError());
 
-      float2 p[3] = {params_.cam.project(cc[0]), params_.cam.project(cc[1]),
-                     params_.cam.project(cc[2])};
-      float area = edge(p[0], p[1], p[2]);
-      if (std::fabs(area) < 1e-6f)
-        continue;
-
-      int min_u =
-          std::max(0, (int)std::floor(std::min({p[0].x, p[1].x, p[2].x})));
-      int max_u = std::min(params_.cam.width - 1,
-                           (int)std::ceil(std::max({p[0].x, p[1].x, p[2].x})));
-      int min_v =
-          std::max(0, (int)std::floor(std::min({p[0].y, p[1].y, p[2].y})));
-      int max_v = std::min(params_.cam.height - 1,
-                           (int)std::ceil(std::max({p[0].y, p[1].y, p[2].y})));
-      if (min_u > max_u || min_v > max_v)
-        continue;
-
-      float3 e1 =
-          make_float3(wc[1].x - wc[0].x, wc[1].y - wc[0].y, wc[1].z - wc[0].z);
-      float3 e2 =
-          make_float3(wc[2].x - wc[0].x, wc[2].y - wc[0].y, wc[2].z - wc[0].z);
-      float3 face_n = host_normalize3(host_cross3(e1, e2));
-      if (host_norm3(face_n) < 1e-6f)
-        continue;
-
-      for (int y = min_v; y <= max_v; y++)
-      {
-        for (int x = min_u; x <= max_u; x++)
-        {
-          float2 q = make_float2((float)x + 0.5f, (float)y + 0.5f);
-          float w0 = edge(p[1], p[2], q) / area;
-          float w1 = edge(p[2], p[0], q) / area;
-          float w2 = edge(p[0], p[1], q) / area;
-          if (w0 < -1e-5f || w1 < -1e-5f || w2 < -1e-5f)
-            continue;
-          float z = w0 * cc[0].z + w1 * cc[1].z + w2 * cc[2].z;
-          int px = y * params_.cam.width + x;
-          if (z <= 0.0f)
-            continue;
-
-          float cur = zbuf[px].load();
-          while (z < cur)
-          {
-            // try to atomically claim this pixel with a smaller depth
-            if (zbuf[px].compare_exchange_strong(cur, z))
-            {
-              // successful winner — write outputs (safe because only the
-              // winner writes to this pixel after successful swap)
-              out_v[px] = make_float3(w0 * wc[0].x + w1 * wc[1].x + w2 * wc[2].x,
-                                      w0 * wc[0].y + w1 * wc[1].y + w2 * wc[2].y,
-                                      w0 * wc[0].z + w1 * wc[1].z + w2 * wc[2].z);
-              out_n[px] = face_n;
-              float3 cp = make_float3(w0 * verts[ids[0]].x + w1 * verts[ids[1]].x +
-                                          w2 * verts[ids[2]].x,
-                                      w0 * verts[ids[0]].y + w1 * verts[ids[1]].y +
-                                          w2 * verts[ids[2]].y,
-                                      w0 * verts[ids[0]].z + w1 * verts[ids[1]].z +
-                                          w2 * verts[ids[2]].z);
-              out_vidx[px] = canonical_voxel_index(cp);
-              break;
-            }
-            // cur updated by compare_exchange_strong; loop retries if still larger
-          }
-        }
-      }
-    }
+    resolve_rasterized_triangles_kernel<<<grid1d(n_pixels), 256>>>(
+        d_mesh_vertices_.data, d_mesh_warped_.data, d_mesh_triangles_.data,
+        num_vertices, params_.cam, T_cam_world, params_.tsdf.origin,
+        params_.tsdf.voxel_size, params_.tsdf.dims, d_raster_ztri_.data,
+        d_vertices_live_.data, d_normals_live_.data, d_hit_voxel_idx_.data);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
     if (profile)
       profile->tri_raster_ms += elapsed_ms(t_tri_raster);
 
     auto t_upload = std::chrono::high_resolution_clock::now();
-    d_vertices_live_.upload(out_v);
-    d_normals_live_.upload(out_n);
-    d_hit_voxel_idx_.upload(out_vidx);
     if (profile)
     {
       profile->raster_upload_ms += elapsed_ms(t_upload);

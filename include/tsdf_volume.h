@@ -48,6 +48,11 @@ class TSDFVolume {
                        std::vector<float3> &normals,
                        std::vector<int3> &triangles) const;
 
+  // Estrai mesh direttamente su GPU. Usato nel tracking per evitare il
+  // round-trip CPU->GPU prima di skinning e rasterizzazione.
+  void extract_surface_device(DeviceArray<float3> &vertices,
+                              DeviceArray<int3> &triangles) const;
+
   // Accessors
   const Params &params() const { return params_; }
   TSDFVoxel *device_data() { return d_voxels_.data; }

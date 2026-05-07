@@ -408,6 +408,48 @@ __global__ void generate_surface_kernel(const TSDFVoxel *voxels, int3 dims,
     }
 }
 
+__global__ void generate_surface_vertices_kernel(const TSDFVoxel *voxels, int3 dims,
+                                                 float3 origin, float voxel_size,
+                                                 float3 *vertices,
+                                                 int3 *triangles,
+                                                 int *counters) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int z = blockIdx.z * blockDim.z + threadIdx.z;
+    if (x >= dims.x - 1 || y >= dims.y - 1 || z >= dims.z - 1) return;
+
+    float values[8];
+    float3 points[8];
+    int cube_idx = load_cube(voxels, x, y, z, dims, values, points);
+    if (cube_idx <= 0 || cube_idx >= 255) return;
+
+    int n_triangles = count_triangles_for_cube(cube_idx);
+    if (n_triangles == 0) return;
+
+    float3 edge_vertices[12];
+    for (int e = 0; e < 12; ++e) {
+        int c0 = kEdgeCorners[e][0];
+        int c1 = kEdgeCorners[e][1];
+        edge_vertices[e] = interpolate_edge(points[c0], points[c1], values[c0], values[c1],
+                                            origin, voxel_size);
+    }
+
+    int vertex_base = atomicAdd(&counters[0], n_triangles * 3);
+    int triangle_base = atomicAdd(&counters[1], n_triangles);
+    for (int t = 0; t < n_triangles; ++t) {
+        int table_offset = t * 3;
+        float3 v0 = edge_vertices[triangle_table[cube_idx][table_offset + 0]];
+        float3 v1 = edge_vertices[triangle_table[cube_idx][table_offset + 1]];
+        float3 v2 = edge_vertices[triangle_table[cube_idx][table_offset + 2]];
+        int out_v = vertex_base + table_offset;
+
+        vertices[out_v + 0] = v0;
+        vertices[out_v + 1] = v1;
+        vertices[out_v + 2] = v2;
+        triangles[triangle_base + t] = make_int3(out_v + 0, out_v + 1, out_v + 2);
+    }
+}
+
 }  // namespace
 
 void TSDFVolume::extract_surface(std::vector<float3> &out_vertices,
@@ -456,4 +498,44 @@ void TSDFVolume::extract_surface(std::vector<float3> &out_vertices,
     d_vertices.download(out_vertices);
     d_normals.download(out_normals);
     d_triangles.download(out_triangles);
+}
+
+void TSDFVolume::extract_surface_device(DeviceArray<float3> &vertices,
+                                        DeviceArray<int3> &triangles) const {
+    vertices.free();
+    triangles.free();
+
+    if (!d_voxels_.data || params_.dims.x < 2 || params_.dims.y < 2 || params_.dims.z < 2) {
+        return;
+    }
+
+    DeviceArray<int> d_counters(2);
+    d_counters.zero();
+
+    dim3 block(8, 8, 8);
+    dim3 grid((params_.dims.x - 1 + block.x - 1) / block.x,
+              (params_.dims.y - 1 + block.y - 1) / block.y,
+              (params_.dims.z - 1 + block.z - 1) / block.z);
+
+    count_surface_kernel<<<grid, block>>>(d_voxels_.data, params_.dims, d_counters.data);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    int counts[2] = {};
+    CUDA_CHECK(cudaMemcpy(counts, d_counters.data, sizeof(counts), cudaMemcpyDeviceToHost));
+    int vertex_count = counts[0];
+    int triangle_count_total = counts[1];
+    if (vertex_count <= 0 || triangle_count_total <= 0) {
+        return;
+    }
+
+    vertices.allocate(static_cast<size_t>(vertex_count));
+    triangles.allocate(static_cast<size_t>(triangle_count_total));
+    d_counters.zero();
+
+    generate_surface_vertices_kernel<<<grid, block>>>(
+        d_voxels_.data, params_.dims, params_.origin, params_.voxel_size,
+        vertices.data, triangles.data, d_counters.data);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
