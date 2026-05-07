@@ -18,34 +18,34 @@ tsdf:
   dims: [256, 256, 256]
   voxel_size: 0.005
   truncation: 0.03
-  origin: [-0.768, -0.768, 0.05]
+  origin: [-0.7, -0.7, 0.5]
 
 solver:
   gn_iterations: 2
-  pcg_iterations: 12   # ridotto da 400: evita over-optimization
-  lambda_smooth: 20.0 # arap
+  pcg_iterations: 20   # ridotto da 400: evita over-optimization
+  lambda_smooth: 40.0 # arap
   lambda_damping: 0.05 # aumentato per più regolarizzazione
 
 warp:
   node_radius: 0.03
   node_min_dist: 0.025
-  max_nodes: 8192
-  node_update_every_n: 2
+  max_nodes: 4096
+  node_update_every_n: 5
   max_dx_mean: 0.2    # ridotto da 2.0: limita deformazioni locali
   max_update_rot: 0.12  # ~7°, prevenire salti grandi
   max_update_trans: 0.04  # 4cm, contenere step size
   update_scale: 0.08  # ridotto da 0.1: step più piccoli
   integrate_warped: true
-  integrate_min_optimized_count: 0
+  integrate_min_optimized_count: 1
   integrate_unwarped_fallback: false
 
 icp:
-  rigid_tracking: true
+  rigid_tracking: false
   dist_threshold: 0.005
   angle_threshold: 0.85
   view_threshold: 0.2
   search_radius_px: 1
-  min_valid_corrs: 50
+  min_valid_corrs: 30000
 
 sift:
   enabled: true
@@ -58,6 +58,11 @@ sift:
   max_ambiguity: 0.85
   max_3d_dist: 0.08
   weight: 0.25
+
+profiler:
+  enabled: true
+  every_n: 1
+  quiet: false
 
 bbox:
   enabled: false

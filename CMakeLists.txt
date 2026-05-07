@@ -43,7 +43,7 @@ include_directories(
 )
 
 # Library
-file(GLOB_RECURSE SOURCES src/*.cpp src/*.cu kernels/*.cu)
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp src/*.cu kernels/*.cu)
 add_library(dfusion STATIC ${SOURCES})
 set_target_properties(dfusion PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(dfusion
@@ -107,6 +107,7 @@ if(BUILD_TESTS)
     add_executable(test_tsdf_integration
         tests/test_tsdf_integration.cu
         src/tsdf_volume.cu
+        src/marching_cubes.cu
         kernels/tsdf_kernels.cu
     )
     set_target_properties(test_tsdf_integration PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
@@ -128,6 +129,7 @@ if(BUILD_TESTS)
     add_executable(test_mesh_extraction
         tests/test_mesh_extraction.cu
         src/tsdf_volume.cu
+        src/marching_cubes.cu
         kernels/tsdf_kernels.cu
     )
     set_target_properties(test_mesh_extraction PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
@@ -161,4 +163,3 @@ else()
     message(STATUS "Unit tests disabled (BUILD_TESTS=OFF)")
     message(STATUS "Enable with: cmake -DBUILD_TESTS=ON ..")
 endif()
-
