@@ -85,6 +85,25 @@ static AppConfig load_config(const std::string &path)
   out.df.max_nodes = w["max_nodes"].as<int>();
   if (w["node_update_every_n"])
     out.df.node_update_every_n = w["node_update_every_n"].as<int>();
+  if (w["prune_nodes"])
+    out.df.prune_nodes = w["prune_nodes"].as<bool>();
+  if (w["prune_disconnected"])
+    out.df.prune_disconnected = w["prune_disconnected"].as<bool>();
+  if (w["prune_min_observed_voxels"])
+    out.df.prune_min_observed_voxels =
+        w["prune_min_observed_voxels"].as<int>();
+  if (w["prune_min_surface_voxels"])
+    out.df.prune_min_surface_voxels =
+        w["prune_min_surface_voxels"].as<int>();
+  if (w["prune_min_component_size"])
+    out.df.prune_min_component_size = w["prune_min_component_size"].as<int>();
+  if (w["prune_support_radius_factor"])
+    out.df.prune_support_radius_factor =
+        w["prune_support_radius_factor"].as<float>();
+  if (w["prune_surface_tsdf_abs"])
+    out.df.prune_surface_tsdf_abs = w["prune_surface_tsdf_abs"].as<float>();
+  if (w["prune_empty_tsdf"])
+    out.df.prune_empty_tsdf = w["prune_empty_tsdf"].as<float>();
   if (w["max_dx_mean"])
     out.df.max_dx_mean = w["max_dx_mean"].as<float>();
   if (w["max_update_rot"])

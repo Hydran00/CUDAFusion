@@ -48,12 +48,15 @@ class DynamicFusionPipeline
     double solve_ms = 0.0;
     double validate_ms = 0.0;
     double apply_ms = 0.0;
+    double rmse_ms = 0.0;
+    double line_search_ms = 0.0;
     int raster_calls = 0;
 
     bool has_work() const
     {
       return raster_calls > 0 || corr_ms > 0.0 || solve_ms > 0.0 ||
-             validate_ms > 0.0 || apply_ms > 0.0 || rigid_ms > 0.0;
+             validate_ms > 0.0 || apply_ms > 0.0 || rigid_ms > 0.0 ||
+             rmse_ms > 0.0 || line_search_ms > 0.0;
     }
   };
 
@@ -80,6 +83,14 @@ public:
     int min_valid_corrs = 2000;
     int max_nodes = 4096;
     int node_update_every_n = 5;
+    bool prune_nodes = true;
+    bool prune_disconnected = true;
+    int prune_min_observed_voxels = 8;
+    int prune_min_surface_voxels = 2;
+    int prune_min_component_size = 4;
+    float prune_support_radius_factor = 1.0f;
+    float prune_surface_tsdf_abs = 0.45f;
+    float prune_empty_tsdf = 0.75f;
     float max_dx_mean = 0.03f;
     float max_update_rot = 0.05f;
     float max_update_trans = 0.03f;
@@ -326,7 +337,9 @@ public:
 
         if (num_corrs < params_.min_valid_corrs)
           break;
+        auto t_base_rmse = std::chrono::high_resolution_clock::now();
         double base_rmse = correspondence_rmse();
+        tracking_profile.rmse_ms += elapsed_ms(t_base_rmse);
 
         // 5. Ottimizzazione Gauss-Newton
         // Minimal diagnostic instrumentation: when debug_vis is enabled,
@@ -350,20 +363,20 @@ public:
                        (double)(c.dst.z - c.src.z) * c.normal.z;
             sumw += c.weight;
             sumsq += r * r;
-            if (valid_cnt <= 8)
-            {
-              printf("[DIAG corr %zu] src=(%.6e,%.6e,%.6e) dst=(%.6e,%.6e,%.6e) n=(%.6e,%.6e,%.6e) r=%.6e w=%.6e\n",
-                     valid_cnt,
-                     (double)c.src.x, (double)c.src.y, (double)c.src.z,
-                     (double)c.dst.x, (double)c.dst.y, (double)c.dst.z,
-                     (double)c.normal.x, (double)c.normal.y, (double)c.normal.z,
-                     r, (double)c.weight);
-            }
+            // if (valid_cnt <= 8)
+            // {
+            //   printf("[DIAG corr %zu] src=(%.6e,%.6e,%.6e) dst=(%.6e,%.6e,%.6e) n=(%.6e,%.6e,%.6e) r=%.6e w=%.6e\n",
+            //          valid_cnt,
+            //          (double)c.src.x, (double)c.src.y, (double)c.src.z,
+            //          (double)c.dst.x, (double)c.dst.y, (double)c.dst.z,
+            //          (double)c.normal.x, (double)c.normal.y, (double)c.normal.z,
+            //          r, (double)c.weight);
+            // }
           }
           double cpu_rmse = valid_cnt ? std::sqrt(sumsq / (double)valid_cnt)
                                       : 0.0;
-          printf("[DIAG corrs] valid=%zu sumw=%.6e cpu_rmse=%.6e\n",
-                 valid_cnt, sumw, cpu_rmse);
+          // printf("[DIAG corrs] valid=%zu sumw=%.6e cpu_rmse=%.6e\n",
+          //        valid_cnt, sumw, cpu_rmse);
         }
 
         auto t_solve = std::chrono::high_resolution_clock::now();
@@ -476,16 +489,19 @@ public:
         // ---- APPLY SOLO SE OK ----
         if (iter_ok)
         {
+          auto t_line_search = std::chrono::high_resolution_clock::now();
           if (params_.update_scale <= 0.0f || !std::isfinite(base_rmse))
             break;
 
           warp_field_->save_transforms();
-          float trial_scales[] = {params_.update_scale,
-                                  0.5f * params_.update_scale,
-                                  0.25f * params_.update_scale,
-                                  -params_.update_scale,
-                                  -0.5f * params_.update_scale,
-                                  -0.25f * params_.update_scale};
+          float trial_scales[] = {
+              params_.update_scale,
+              // 0.5f * params_.update_scale,
+              // 0.25f * params_.update_scale,
+              // -params_.update_scale,
+              // -0.5f * params_.update_scale,
+              // -0.25f * params_.update_scale
+          };
           float best_scale = 0.0f;
           double best_rmse = base_rmse;
 
@@ -514,7 +530,9 @@ public:
             auto t_corr_check = std::chrono::high_resolution_clock::now();
             int checked_corrs = find_correspondences(false, false);
             tracking_profile.corr_ms += elapsed_ms(t_corr_check);
+            auto t_rmse = std::chrono::high_resolution_clock::now();
             double checked_rmse = correspondence_rmse();
+            tracking_profile.rmse_ms += elapsed_ms(t_rmse);
 
             if (checked_corrs >= params_.min_valid_corrs &&
                 checked_corrs >= (int)(0.75f * (float)num_corrs) &&
@@ -529,7 +547,10 @@ public:
                  gn, base_rmse, best_rmse, (double)best_scale);
           warp_field_->restore_transforms();
           if (best_scale == 0.0f)
+          {
+            tracking_profile.line_search_ms += elapsed_ms(t_line_search);
             break;
+          }
 
           auto t_apply = std::chrono::high_resolution_clock::now();
           upload_scaled_delta_x(best_scale);
@@ -553,6 +574,7 @@ public:
           num_corrs = find_correspondences(false, false);
           tracking_profile.corr_ms += elapsed_ms(t_corr_check);
           warp_update_ok = true;
+          tracking_profile.line_search_ms += elapsed_ms(t_line_search);
         }
         else
         {
@@ -624,6 +646,13 @@ public:
                 << " | total=" << ms << " ms\n";
       if (tracking_profile.has_work())
       {
+        double tracking_accounted =
+            tracking_profile.raster_total_ms + tracking_profile.corr_ms +
+            tracking_profile.rigid_ms + tracking_profile.sift_aug_ms +
+            tracking_profile.solve_ms + tracking_profile.validate_ms +
+            tracking_profile.apply_ms + tracking_profile.rmse_ms;
+        double tracking_other =
+            std::max(0.0, profile_tracking_ms - tracking_accounted);
         std::cout << "[tracking profile frame " << std::setw(4) << frame_count_
                   << "] " << std::fixed << std::setprecision(2)
                   << "raster_total=" << tracking_profile.raster_total_ms << " ms"
@@ -638,6 +667,10 @@ public:
                   << " | solve=" << tracking_profile.solve_ms << " ms"
                   << " | validate=" << tracking_profile.validate_ms << " ms"
                   << " | apply=" << tracking_profile.apply_ms << " ms"
+                  << " | rmse=" << tracking_profile.rmse_ms << " ms"
+                  << " | line_search=" << tracking_profile.line_search_ms
+                  << " ms"
+                  << " | other=" << tracking_other << " ms"
                   << " | raster_calls=" << tracking_profile.raster_calls
                   << "\n";
       }
@@ -810,49 +843,35 @@ private:
     std::vector<float3> verts, norms;
     std::vector<int3> tris;
     volume_->extract_surface(verts, norms, tris);
-    int added = warp_field_->add_nodes_from_surface(verts, params_.node_min_dist,
-                                                    &norms);
+    int added = warp_field_->add_nodes_from_mesh_geodesic(
+        verts, tris, params_.node_min_dist, &norms);
     if (added > 0)
       warp_field_->compute_voxel_knn(*volume_, d_voxel_knn_, d_voxel_knn_w_);
   }
 
   void update_node_graph()
   {
-    // Download canonical voxel hit-map from raycast → convert to canonical
-    // world pos Avoids MC; gives correct canonical (not warped) positions for
-    // new nodes
-    int n_pixels = params_.cam.width * params_.cam.height;
-    std::vector<int> h_vidx(n_pixels);
-    cudaMemcpy(h_vidx.data(), d_hit_voxel_idx_.data, n_pixels * sizeof(int),
-               cudaMemcpyDeviceToHost);
+    bool need_knn_update = false;
+    WarpField::PruneParams prune;
+    prune.enabled = params_.prune_nodes;
+    prune.remove_disconnected = params_.prune_disconnected;
+    prune.min_observed_voxels = params_.prune_min_observed_voxels;
+    prune.min_surface_voxels = params_.prune_min_surface_voxels;
+    prune.min_component_size = params_.prune_min_component_size;
+    prune.support_radius_factor = params_.prune_support_radius_factor;
+    prune.surface_tsdf_abs = params_.prune_surface_tsdf_abs;
+    prune.empty_tsdf = params_.prune_empty_tsdf;
+    int removed = warp_field_->prune_nodes(*volume_, prune);
+    need_knn_update = removed > 0;
 
-    const auto &tp = params_.tsdf;
-    std::vector<float3> canonical_pts;
-    std::vector<float3> canonical_norms;
-    canonical_pts.reserve(n_pixels / 4);
-    canonical_norms.reserve(n_pixels / 4);
-    std::vector<float3> h_depth_normals(n_pixels);
-    cudaMemcpy(h_depth_normals.data(), d_depth_normals_.data,
-               n_pixels * sizeof(float3), cudaMemcpyDeviceToHost);
-    for (int px = 0; px < n_pixels; px++)
-    {
-      int vidx = h_vidx[px];
-      if (vidx < 0)
-        continue;
-      int vx = vidx % tp.dims.x;
-      int vy = (vidx / tp.dims.x) % tp.dims.y;
-      int vz = vidx / (tp.dims.x * tp.dims.y);
-      canonical_pts.push_back(make_float3(tp.origin.x + vx * tp.voxel_size,
-                                          tp.origin.y + vy * tp.voxel_size,
-                                          tp.origin.z + vz * tp.voxel_size));
-      canonical_norms.push_back(
-          host_normalize3(camera_pose_.transform_normal(h_depth_normals[px])));
-    }
-
-    int added = warp_field_->add_nodes_from_surface(canonical_pts,
-                                                    params_.node_min_dist,
-                                                    &canonical_norms);
+    std::vector<float3> verts, norms;
+    std::vector<int3> tris;
+    volume_->extract_surface(verts, norms, tris);
+    int added = warp_field_->add_nodes_from_mesh_geodesic(
+        verts, tris, params_.node_min_dist, &norms);
     if (added > 0)
+      need_knn_update = true;
+    if (need_knn_update && warp_field_->num_nodes() > 0)
     {
       warp_field_->compute_voxel_knn(*volume_, d_voxel_knn_, d_voxel_knn_w_);
     }

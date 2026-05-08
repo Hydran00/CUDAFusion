@@ -131,11 +131,22 @@ static cv::Mat dbg_verts(const std::vector<float3> &verts,
         int j = (*nodes)[i].neighbors[k];
         if (j < 0 || j >= n)
           continue;
+        if (j < i)
+          continue;
         float3 pj = dq_transform_point(
             dq_centered((*transforms)[j], (*nodes)[j].pos), (*nodes)[j].pos);
         cv::Point b;
         if (project(pj, b))
-          cv::line(color, a, b, {100, 0, 255}, 1, cv::LINE_AA);
+        {
+          float3 d = make_float3((*nodes)[i].pos.x - (*nodes)[j].pos.x,
+                                 (*nodes)[i].pos.y - (*nodes)[j].pos.y,
+                                 (*nodes)[i].pos.z - (*nodes)[j].pos.z);
+          float len = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+          float ref = std::max((*nodes)[i].radius, (*nodes)[j].radius);
+          cv::Scalar edge_col = (len > 2.5f * ref) ? cv::Scalar(0, 0, 255)
+                                                    : cv::Scalar(100, 0, 255);
+          cv::line(color, a, b, edge_col, 1, cv::LINE_AA);
+        }
       }
       cv::circle(color, a, 2, {0, 250, 255}, -1, cv::LINE_AA);
     }

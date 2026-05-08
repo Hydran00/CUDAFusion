@@ -36,6 +36,28 @@ class WarpField {
                              float min_dist_between_nodes,
                              const std::vector<float3>* surface_normals = nullptr);
 
+  // Geodesic-aware variant: samples nodes on the mesh surface, then rebuilds
+  // graph edges from bounded Dijkstra distances over mesh connectivity.
+  int add_nodes_from_mesh_geodesic(const std::vector<float3>& surface_vertices,
+                                   const std::vector<int3>& surface_triangles,
+                                   float min_dist_between_nodes,
+                                   const std::vector<float3>* surface_normals = nullptr);
+
+  struct PruneParams {
+    bool enabled = true;
+    bool remove_disconnected = true;
+    int min_observed_voxels = 8;
+    int min_surface_voxels = 2;
+    int min_component_size = 4;
+    float support_radius_factor = 1.0f;
+    float surface_tsdf_abs = 0.45f;
+    float empty_tsdf = 0.75f;
+  };
+
+  // Remove nodes that no longer have TSDF zero-crossing support, plus tiny
+  // graph islands left disconnected from the geometry.
+  int prune_nodes(const TSDFVolume& volume, const PruneParams& params);
+
   // Inizializza trasformazione nuovo nodo
   // per interpolazione dai vicini esistenti
   void init_node_transform(int new_node_idx);

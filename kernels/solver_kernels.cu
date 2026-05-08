@@ -581,7 +581,7 @@ void GaussNewtonSolver::assemble_system(
     assemble_data_term_kernel<<<grid, block>>>(
         corrs.data, num_corrs, d_nodes, d_transforms,
         A_.values.data, b_.data,
-        A_.row_ptr.data, A_.col_idx.data, num_nodes, 0.05f /*huber delta*/);
+        A_.row_ptr.data, A_.col_idx.data, num_nodes, 0.2f /*huber delta*/);
 
     // Smoothness term
     int grid_nodes = (num_nodes + block - 1) / block;

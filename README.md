@@ -1,469 +1,469 @@
-# CUDA-Accelerated Non-rigid 3D Reconstruction (DynamicFusion implementation)
+# CUDA Non rigid RGB-D Fusion
 
-A real-time volumetric fusion system implemented in CUDA that reconstructs dynamic 3D scenes from depth sensor sequences. This implementation combines non-rigid surface tracking with volumetric TSDF fusion to handle scenes with deforming objects.
+CUDA implementation of a non-rigid RGB-D fusion pipeline. The system reconstructs dynamic scenes by combining a canonical TSDF volume, a deformation graph, projective ICP, sparse SIFT constraints, and GPU-accelerated mesh extraction/rasterization.
 
-## Overview
+The design follows the main ideas of **DynamicFusion** and **VolumeDeform**, with several practical additions for robustness and speed: CUDA TSDF integration, VolumeDeform-style deformed mesh prediction, geodesic graph edges, node pruning, sparse CudaSift support, profiling, and Open3D visualization.
 
-**CUDAFusion** is a state-of-the-art algorithm for fusing depth data from RGB-D sensors (based on an improved version of DynamicFusion) into a coherent 3D reconstruction that adapts to non-rigid deformations. This CUDA implementation accelerates the algorithm for real-time performance.
+## Example Videos
 
-### Key Features
+Add your examples here. This table is intentionally visible near the top.
 
-- **TSDF (Truncated Signed Distance Function) Fusion**: Volumetric 3D reconstruction from depth frames
-- **Non-Rigid Warp Fields**: Models dynamic deformations using a hierarchical warp graph
-- **Real-Time Performance**: GPU-accelerated using CUDA
-- **Real-Time Visualization**: Open3D integration for live mesh display
-- **Flexible Input**: Supports multiple dataset formats (TUM, ICL, RAW_PNG)
-- **Synthetic Testing**: Generate synthetic depth sequences for development
+| Scene | Input | Output / Video | Notes |
+| ----- | ----- | -------------- | ----- |
+| TODO  | TODO  | TODO           | TODO  |
+| TODO  | TODO  | TODO           | TODO  |
+| TODO  | TODO  | TODO           | TODO  |
 
----
+## What It Does
 
-## Pipeline Architecture
+For each depth frame, the pipeline:
 
-### 1. **Input & Configuration** 
-```
-Depth Sequence (RAW_PNG, TUM, ICL format)
-       ↓
-   Configuration (YAML)
-       ↓
-   Camera Intrinsics
-```
+1. Loads depth and optional grayscale color.
+2. Computes depth normals.
+3. Predicts the current live surface from the canonical TSDF.
+4. Tracks the surface with projective ICP and optional SIFT correspondences.
+5. Optimizes a deformation graph with data and ARAP smoothness terms.
+6. Integrates the new depth frame into the canonical TSDF.
+7. Updates and prunes deformation graph nodes.
+8. Displays or saves canonical/warped meshes.
 
-The pipeline starts by loading:
-- A depth frame sequence from disk (or generating synthetic test data)
-- Application configuration (YAML file with algorithm parameters)
-- Camera calibration (intrinsic matrix: fx, fy, cx, cy)
+The canonical model stays in a stable reference space. The warp field maps canonical geometry into the current live frame.
 
-**Supported Formats:**
-- **RAW_PNG**: Single-channel uint16 depth images (depth in millimeters)
-- **TUM**: TUM RGB-D Benchmark format (timestamp + filename format)
-- **ICL**: ICL-NUIM Indoor Dataset format
+## Main Ideas
 
----
+### DynamicFusion Basis
 
-### 2. **Frame Loading** 
-```
-DepthSequence Class
-       ↓
-   Load Frame i
-       ↓
-   Convert to meters (apply depth_scale)
-       ↓
-   OpenCV Mat (float32 depth_m)
-```
+DynamicFusion introduced real-time non-rigid reconstruction by maintaining:
 
-Each frame is:
-- Loaded from disk (PNG, or other format)
-- Depth values converted from uint16 to float (millimeters → meters)
-- Stored as a `DepthFrame` structure with:
-  - `depth_m`: depth map in meters (float32, CV_32F)
-  - `color_gray`: grayscale intensity image
-  - `timestamp`: frame timestamp
+- a canonical volumetric model;
+- a warp field represented by deformation nodes;
+- an optimization loop that aligns the warped canonical surface to the current depth frame;
+- smoothness regularization to keep neighboring nodes locally coherent.
 
----
+This project keeps that structure, but implements the expensive parts in CUDA.
 
-### 3. **Frame Processing Pipeline**
-```
-DynamicFusionPipeline::process_frame()
-       ↓
-   ┌─────────────────────────────┐
-   │ 1. Pose Estimation          │
-   │    (Visual Odometry)        │
-   └─────────────────────────────┘
-              ↓
-   ┌─────────────────────────────┐
-   │ 2. Warp Field Update        │
-   │    (Track Deformations)     │
-   └─────────────────────────────┘
-              ↓
-   ┌─────────────────────────────┐
-   │ 3. TSDF Volume Integration  │
-   │    (Fuse Depth into Volume) │
-   └─────────────────────────────┘
-              ↓
-   ┌─────────────────────────────┐
-   │ 4. Mesh Extraction          │
-   │    (Marching Cubes)         │
-   └─────────────────────────────┘
-```
+### VolumeDeform-style Prediction
 
-#### 3.1 **Pose Estimation**
-- Estimates camera motion between frames
-- Uses visual feature matching (SIFT features via CudaSift)
-- Computes SE(3) transformation matrix (rotation + translation)
-- Handles both rigid and non-rigid motion
+Instead of relying only on TSDF raycasting, the pipeline can:
 
-#### 3.2 **Warp Field Update**
-- Maintains a hierarchical deformation graph
-- Tracks non-rigid surface deformations
-- Updates warp nodes based on:
-  - Feature correspondences from pose estimation
-  - Smoothness constraints (rigidity preservation)
-- Represents local rotations and translations at control points
+- extract the canonical mesh;
+- skin/deform vertices with the current warp field;
+- rasterize the deformed mesh into the current camera;
+- use that rendered live surface for ICP correspondences.
 
-#### 3.3 **TSDF Volume Integration**
-- Updates a 3D voxel grid with new depth measurements
-- TSDF encodes:
-  - Signed distance from surface (positive = inside, negative = outside)
-  - Truncation: clamps values to [-truncation_distance, +truncation_distance]
-- Integration process:
-  1. Project depth pixels into 3D world coordinates
-  2. Apply warp field to transform to canonical space
-  3. Update voxel values using weighted averaging
-  4. Weight based on depth confidence and viewing angle
+This is closer to the VolumeDeform tracking style and makes the prediction stage more explicit and easier to debug.
 
-```cpp
-// Pseudocode: TSDF Integration
-for each pixel (u, v) in depth_map:
-    if depth_map[v, u] is valid:
-        world_point = unproject(u, v, depth, intrinsics)
-        canonical_point = warp_field.inverse_warp(world_point)
-        for each voxel near canonical_point:
-            tsdf_dist = truncated_signed_distance(canonical_point)
-            tsdf_voxel[x, y, z].update(tsdf_dist, weight)
-```
+### Deformation Graph
 
-#### 3.4 **Mesh Extraction**
-- Uses Marching Cubes algorithm on the TSDF volume
-- Extracts iso-surface at zero-crossing (surface of the object)
-- Produces triangle mesh with vertices and normals
-- **Two versions:**
-  - **Canonical Mesh**: In the rest/reference frame (original shape)
-  - **Warped Mesh**: With non-rigid deformations applied
+Nodes are sampled from the TSDF surface. Each node stores:
 
----
+- canonical position;
+- canonical normal;
+- influence radius;
+- graph neighbors;
+- dual-quaternion transform.
 
-### 4. **TSDF Volume Representation**
-```
-3D Voxel Grid (Canonical Space)
-├─ Resolution: 512x512x512 (configurable)
-├─ Voxel Size: 0.005 m (5mm per voxel)
-├─ Value Range: [-1.0, +1.0] (truncated distance in units of truncation)
-└─ Each Voxel Contains:
-   ├─ Signed Distance
-   ├─ Weight (confidence)
-   └─ Color (optional)
-```
+Graph edges can be rebuilt using geodesic distances over the extracted mesh, which helps avoid connecting nearby but topologically unrelated surfaces, such as an arm close to the torso.
 
-The TSDF volume represents 3D space in the canonical frame:
-- **Inside object**: TSDF < 0 (negative distance)
-- **Surface**: TSDF ≈ 0 (zero-crossing)
-- **Outside object**: TSDF > 0 (positive distance)
-- **Truncation**: Values beyond ±truncation_distance are clamped
+### Node Pruning
 
----
+Nodes are pruned during graph updates when they no longer have TSDF surface support or when they form small disconnected islands. This is useful when nodes were created in regions that later become observed free space, or when floating fragments remain after fusion.
 
-### 5. **Warp Field**
-```
-Hierarchical Deformation Graph
-├─ Level 0: ~512 control points (coarse)
-├─ Level 1: ~4096 control points (medium)
-└─ Level 2: ~32768 control points (fine)
+Important pruning parameters:
 
-For each control point:
-├─ Position (x, y, z)
-├─ Rotation (quaternion)
-└─ Neighbors (weighted graph edges)
-```
+| Parameter                     | Meaning                                                                 |
+| ----------------------------- | ----------------------------------------------------------------------- |
+| `prune_nodes`                 | Enable TSDF/graph pruning.                                              |
+| `prune_disconnected`          | Remove small disconnected graph components.                             |
+| `prune_min_observed_voxels`   | Minimum observed TSDF voxels needed before making a pruning decision.   |
+| `prune_min_surface_voxels`    | Minimum near-surface voxels required to keep a node.                    |
+| `prune_min_component_size`    | Graph islands smaller than this are removed.                            |
+| `prune_support_radius_factor` | Radius multiplier used when checking TSDF support around a node.        |
+| `prune_surface_tsdf_abs`      | A voxel counts as surface support when `abs(tsdf)` is below this value. |
+| `prune_empty_tsdf`            | A voxel counts as free space when `tsdf` is above this value.           |
 
-The warp field enables:
-- **Non-rigid deformation tracking**: Captures bending, stretching, deformation
-- **Local detail preservation**: High-resolution control at fine scales
-- **Smooth interpolation**: Gaussian kernels for smooth transitions between control points
+## Build
 
-**Warp Operation:**
-```
-warped_point = warp_field(point)
-= sum over nearby warp nodes n:
-    w_n * (R_n * (point - p_n) + p_n + t_n)
-where w_n = gaussian_weight(distance(point, p_n))
-```
+### Dependencies
 
----
+Required:
 
-### 6. **Output Generation**
+- CUDA Toolkit
+- CMake 3.18+
+- OpenCV
+- Eigen3
+- Open3D
+- yaml-cpp, fetched automatically by CMake
+- CudaSift in `thirdparty/CudaSift`
 
-#### 6.1 **Real-Time Visualization** (Optional)
-- Open3D visualizer for live 3D mesh display
-- Updates mesh every frame (or when new data is integrated)
-- Shows coordinate frame and camera reference
-- Interactive viewer (rotate, zoom, pan)
-
-#### 6.2 **Mesh Checkpoints**
-- Every 30 frames: saves intermediate meshes
-- Files saved:
-  - `mesh_frame_XX_canonical.ply`: Undeformed reconstruction
-  - `mesh_frame_XX_warped.ply`: With deformations applied
-
-#### 6.3 **Final Output**
-- `mesh_final_canonical.ply`: Final canonical mesh (full sequence)
-- `mesh_final_warped.ply`: Final warped mesh (full sequence)
-
----
-
-## Usage
-
-### Prerequisites
+On Ubuntu, the system packages are usually:
 
 ```bash
-# Dependencies
-# Install CUDA Toolkit, then 
-sudo apt-get install libopencv-dev libyaml-cpp-dev
-# Build
-cd myfusion
-mkdir -p build && cd build
-cmake ..
-make -j$(nproc)
+sudo apt-get install cmake build-essential libopencv-dev libeigen3-dev
 ```
 
-### Running the Pipeline
+Open3D is currently searched with:
 
-#### 1. **With Synthetic Sequence** (No config file)
+```cmake
+find_package(Open3D REQUIRED HINTS /home/hydran00/Open3D/lib/cmake/Open3D)
+```
+
+Adjust that path in `CMakeLists.txt` if your Open3D installation is elsewhere.
+
+### CudaSift Branch
+
+This repository expects CudaSift under:
+
 ```bash
-./build/run_fusion
+thirdparty/CudaSift
 ```
 
-#### 2. **With Config File**
+Use the CudaSift branch that matches your GPU architecture setup. For example, for Ada Lovelace:
+
+```bash
+cd thirdparty/CudaSift
+git checkout adalovelace
+cd ../..
+```
+
+Use the corresponding branch for other architectures when available.
+
+### Configure With CUDA Architecture
+
+The CUDA architecture is configurable through:
+
+```bash
+-DDFUSION_CUDA_ARCHITECTURES=<arch>
+```
+
+Examples:
+
+```bash
+# Ada Lovelace, e.g. RTX 40xx
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDFUSION_CUDA_ARCHITECTURES=89
+
+# Ampere, e.g. RTX 30xx
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDFUSION_CUDA_ARCHITECTURES=86
+
+# Turing, e.g. RTX 20xx
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDFUSION_CUDA_ARCHITECTURES=75
+
+# Multiple architectures
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDFUSION_CUDA_ARCHITECTURES="86;89"
+
+# Native detection, if supported by your CMake/CUDA combination
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDFUSION_CUDA_ARCHITECTURES=native
+```
+
+Default is `89`, optimized for Ada Lovelace.
+
+### Compile
+
+```bash
+cmake --build build -j$(nproc)
+```
+
+The Release build enables aggressive optimization flags:
+
+- `-O3`
+- CUDA `--use_fast_math`
+- CUDA `--extra-device-vectorization`
+- PTXAS `-O3`
+- host `-march=native`
+- interprocedural optimization
+
+If tracking becomes numerically unstable, the first flags to relax are fast-math flags, not the CUDA architecture.
+
+## Run
+
+With the default config:
+
 ```bash
 ./build/run_fusion config/params.yaml
 ```
 
-### Command-Line Options
+Useful CLI flags:
 
 ```bash
-# Enable visualization
---vis
-
-# Disable visualization (faster)
---no-vis
-
-# Enable debug visualization
---debug-vis
-
-# Debug output every N frames
---debug-every 5
-
-# Process only first N frames
---max-frames 100
-
-# Specify dataset format
-tum      # TUM RGB-D format
-icl      # ICL-NUIM format
-raw      # Raw PNG format (default)
+--vis              # enable visualization
+--no-vis           # disable visualization
+--debug-vis        # show debug panels
+--debug-every N    # debug every N frames
+--max-frames N     # process only N frames
+tum | icl | raw    # override sequence format
 ```
 
-### Example
+Example:
 
 ```bash
-# Run with visualization on TUM dataset
 ./build/run_fusion config/params.yaml tum --vis --max-frames 300
 ```
 
----
+Outputs:
 
-## Configuration File (YAML)
+- `mesh_final_canonical.ply`
+- `mesh_final_warped.ply`
+- optional intermediate checkpoints from the application loop
 
-Example `config/params.yaml`:
+## Configuration
+
+The default configuration is in `config/params.yaml`.
+
+### Sequence
 
 ```yaml
-# Depth sequence parameters
 sequence:
-  path: /path/to/depth/frames
-  format: raw_png              # raw_png, tum, icl
-  depth_scale: 0.001           # Convert uint16 to meters
+  path: "/path/to/sequence"
+  format: "tum"       # tum | icl | raw
+  depth_scale: 0.001
   start_frame: 0
-  max_frames: -1               # -1 = all frames
-
-  # Camera intrinsics
-  camera:
-    fx: 570.342
-    fy: 570.342
-    cx: 320.0
-    cy: 240.0
-    width: 640
-    height: 480
-
-# Dynamic Fusion parameters
-dynamic_fusion:
-  tsdf:
-    volume_size: 512            # Voxel grid resolution
-    voxel_size: 0.005           # Size of each voxel (meters)
-    truncation_distance: 0.05   # TSDF truncation distance
-    
-  warp_field:
-    num_levels: 3               # Hierarchical levels
-    radius: 0.1                 # Control point influence radius
-    regularization: 0.1         # Smoothness weight
-    
-  pose_estimation:
-    feature_threshold: 0.01
-    max_iterations: 5
-    
-  visualization:
-    mesh_update_interval: 1     # Update every N frames
-    
-  debug:
-    enabled: false
-    every_n_frames: 30
+  max_frames: -1
 ```
 
----
+### Camera
 
-## Architecture Details
-
-### Core Components
-
-#### **DepthSequence**
-- Loads and manages depth frame sequences
-- Supports multiple formats (TUM, ICL, RAW_PNG)
-- Handles depth-to-meters conversion
-- Provides frame iterator interface
-
-#### **DynamicFusionPipeline**
-- Main processing pipeline class
-- Coordinates all stages:
-  1. Pose estimation
-  2. Warp field optimization
-  3. TSDF integration
-  4. Mesh extraction
-- Maintains:
-  - TSDF volume (GPU memory)
-  - Warp field (GPU memory)
-  - Camera pose history
-  - Current mesh
-
-#### **TSDFVolume**
-- 3D voxel grid implementation
-- GPU-accelerated operations:
-  - Volume integration
-  - Trilinear interpolation
-  - Marching cubes extraction
-
-#### **WarpField**
-- Hierarchical deformation graph
-- Control point-based warping
-- GPU-accelerated point transformation
-
-#### **CudaSift** (Third-party)
-- Feature extraction and matching
-- Used for visual odometry (pose estimation)
-
----
-
-## Performance Characteristics
-
-### Typical Performance (on NVIDIA GPU)
-
-| Component         | Time per Frame |
-| ----------------- | -------------- |
-| Pose Estimation   | 5-10 ms        |
-| Warp Field Update | 3-5 ms         |
-| TSDF Integration  | 20-30 ms       |
-| Mesh Extraction   | 10-15 ms       |
-| Visualization     | 5-10 ms        |
-| **Total**         | **50-70 ms**   |
-
-**FPS**: ~15-20 fps (depending on resolution and GPU)
-
-### Memory Usage
-
-| Component          | Memory  |
-| ------------------ | ------- |
-| TSDF Volume (512³) | ~500 MB |
-| Warp Field         | ~50 MB  |
-| Temporary Buffers  | ~200 MB |
-| **Total**          | ~750 MB |
-
----
-
-## File Structure
-
+```yaml
+camera:
+  fx: 570.342
+  fy: 570.342
+  cx: 320.0
+  cy: 240.0
+  width: 640
+  height: 480
 ```
+
+### TSDF
+
+```yaml
+tsdf:
+  dims: [256, 256, 256]
+  voxel_size: 0.005
+  truncation: 0.03
+  origin: [-0.7, -0.7, 0.5]
+  decay_alpha: 1.0
+  max_weight: 50.0
+```
+
+`decay_alpha < 1.0` makes the volume more reactive in dynamic scenes. `1.0` keeps accumulated observations.
+
+### Solver
+
+```yaml
+solver:
+  gn_iterations: 2
+  pcg_iterations: 80
+  lambda_smooth: 50.0
+  lambda_damping: 1.0
+  debug: false
+```
+
+Notes:
+
+- More PCG iterations are not always better. Early stopping can act as a regularizer.
+- Increase `lambda_smooth` if graph edges stretch.
+- Increase `lambda_damping` if updates become unstable.
+
+### Warp Field
+
+```yaml
+warp:
+  node_radius: 0.02
+  node_min_dist: 0.015
+  max_nodes: 2048
+  node_update_every_n: 2
+  prune_nodes: true
+  prune_disconnected: true
+  prune_min_observed_voxels: 2
+  prune_min_surface_voxels: 5
+  prune_min_component_size: 16
+  prune_support_radius_factor: 0.75
+  prune_surface_tsdf_abs: 0.28
+  prune_empty_tsdf: 0.55
+  max_dx_mean: 0.2
+  max_update_rot: 0.12
+  max_update_trans: 0.04
+  update_scale: 0.3
+  integrate_warped: true
+  integrate_min_optimized_count: 1
+  integrate_unwarped_fallback: false
+```
+
+Useful tuning rules:
+
+- Smaller `node_min_dist` creates denser graphs.
+- Smaller `node_radius` gives more local deformation but can require more nodes.
+- Lower `update_scale` is safer.
+- Lower `max_update_trans` and `max_update_rot` prevent sudden graph collapse.
+- `integrate_warped: true` is recommended for dynamic scenes.
+
+### ICP
+
+```yaml
+icp:
+  dist_threshold: 0.15
+  angle_threshold: 0.1
+  view_threshold: 0.1
+  search_radius_px: 10
+  min_valid_corrs: 5000
+```
+
+Large `search_radius_px` and permissive thresholds can recover from faster camera motion, but they also increase runtime and outlier risk. If geometry degrades, make these stricter.
+
+### SIFT
+
+```yaml
+sift:
+  enabled: true
+  max_features: 8192
+  max_history: 12
+  max_matches_per_frame: 96
+  octaves: 5
+  threshold: 3.0
+  max_match_error: 5.0
+  max_ambiguity: 0.85
+  max_3d_dist: 0.2
+  weight: 0.4
+```
+
+Sparse CudaSift matches help when the camera moves too quickly for local projective ICP alone.
+
+### Profiler and Debug
+
+```yaml
+profiler:
+  enabled: true
+  every_n: 1
+  quiet: false
+```
+
+Debug visualization can be enabled with:
+
+```bash
+./build/run_fusion config/params.yaml --debug-vis --debug-every 5
+```
+
+The graph debug panel draws:
+
+- nodes in yellow;
+- normal graph edges in purple;
+- suspicious long edges in red.
+
+## Source Layout
+
+```text
 myfusion/
-├── CMakeLists.txt              # Build configuration
-├── README.md                   # This file
+├── CMakeLists.txt
+├── README.md
 ├── config/
-│   └── params.yaml            # Default configuration
+│   └── params.yaml
 ├── include/
-│   ├── fusion_app.h           # Application header
-│   ├── dynamic_fusion.h       # Main pipeline class
-│   ├── tsdf_volume.h          # TSDF implementation
-│   ├── warp_field.h           # Warp field class
-│   ├── se3_math.cuh           # SE(3) math utilities
-│   ├── solver.h               # Optimization solver
-│   └── ...
-├── src/
-│   ├── tsdf_volume.cu         # TSDF GPU kernels
-│   ├── warp_field.cu          # Warp field GPU kernels
-│   └── ...
+│   ├── fusion_app.h
+│   ├── fusion_debug.h
+│   ├── fusion_math.h
+│   ├── tsdf_volume.h
+│   ├── warp_field.h
+│   ├── solver.h
+│   └── se3_math.cuh
 ├── kernels/
-│   ├── tsdf_kernels.cu        # TSDF integration kernels
-│   ├── solver_kernels.cu      # Solver kernels
-│   └── ...
+│   ├── tsdf_kernels.cu
+│   └── solver_kernels.cu
+├── src/
+│   ├── marching_cubes.cu
+│   ├── mesh_raster_kernels.cu
+│   ├── skinning_kernels.cu
+│   ├── tsdf_volume.cu
+│   └── warp_field.cu
 ├── tests/
-│   └── main.cu                # Main application
+│   └── main.cu
 └── thirdparty/
-    └── CudaSift/              # SIFT feature detector
+    └── CudaSift/
 ```
 
----
+## Performance Notes
 
-## Algorithm Overview (Academic Reference)
+The profiler prints high-level frame timing and tracking sub-timing:
 
-The algorithm implements the Dynamic Fusion approach for non-rigid 3D reconstruction:
+```text
+[profiler frame ...] upload=... normals=... tracking=... fusion=... graph_update=... total=...
+[tracking profile ...] raster_total=... corr=... rigid=... sift_aug=... solve=... rmse=... line_search=... other=... raster_calls=...
+```
 
-### Key Innovations:
+Common bottlenecks:
 
-1. **Real-time TSDF Fusion**: Extends traditional TSDF to handle dynamic scenes
-2. **Hierarchical Warp Field**: Multi-level deformation representation
-3. **Iterative Closest Point (ICP)**: Robust pose estimation
-4. **GPU Acceleration**: CUDA kernels for all compute-intensive operations
+- `corr`: projective correspondence search, especially with large `search_radius_px`;
+- `raster_total`: repeated deformed mesh extraction/rasterization;
+- `sift_aug`: sparse feature matching and correspondence augmentation;
+- `rmse` / `line_search`: repeated trial updates and CPU/GPU transfers;
+- `graph_update`: mesh extraction, node creation, geodesic graph rebuild, pruning.
 
-### Mathematical Foundation:
-
-- **TSDF Definition**: `tsdf(p) = min(truncation, signed_distance(p))`
-- **Warp Operation**: `p_warped = W(p, θ)` where θ are warp parameters
-- **Energy Minimization**: 
-  ```
-  E = E_data + λ * E_regularization
-    = ∑ |tsdf(W(p, θ))| + λ * regularization_loss(θ)
-  ```
-
----
+If `raster_calls` is high, the line search is re-rendering the mesh many times per frame.
 
 ## Troubleshooting
 
-### Common Issues
+### Many correspondences disappear
 
-**Q: "CUDA out of memory" error**
-- A: Reduce TSDF volume size in config, or increase GPU memory allocation
+Try temporarily increasing:
 
-**Q: Poor mesh quality / holes in reconstruction**
-- A: Increase TSDF integration weight, check camera calibration, ensure good frame overlap
+```yaml
+icp:
+  dist_threshold: 0.015
+  angle_threshold: 0.75
+  search_radius_px: 3
+  min_valid_corrs: 10000
+```
 
-**Q: Slow processing / low FPS**
-- A: Check GPU utilization, reduce frame resolution, disable visualization
+Also consider increasing SIFT support:
 
-**Q: Visualization crashes**
-- A: Ensure X11 display is available, or disable visualization with `--no-vis`
+```yaml
+sift:
+  max_history: 12
+  max_matches_per_frame: 96
+  weight: 0.4
+```
 
----
+### Graph edges stretch or collapse
+
+Try:
+
+```yaml
+solver:
+  pcg_iterations: 15
+  lambda_smooth: 100.0
+  lambda_damping: 3.0
+
+warp:
+  update_scale: 0.05
+  max_update_rot: 0.08
+  max_update_trans: 0.025
+```
+
+### Floating islands or flying nodes
+
+Use more aggressive pruning:
+
+```yaml
+warp:
+  prune_nodes: true
+  prune_disconnected: true
+  prune_min_surface_voxels: 5
+  prune_min_component_size: 16
+  prune_empty_tsdf: 0.55
+```
+
+### CUDA out of memory
+
+Reduce:
+
+- `tsdf.dims`
+- `max_nodes`
+- SIFT history/features
 
 ## References
 
-- Newcombe, R. A., et al. "KinectFusion: Real-time 3D reconstruction and interaction using a moving depth camera." (2011)
-- Innmann, M., et al. "VolumeDeform: Real-time volumetric non-rigid reconstruction." (2016)
-- Palazzi, A., et al. "DynamicFusion: Reconstruction and tracking of non-rigid scenes in real-time." (2015)
-
----
+- Newcombe et al., **KinectFusion: Real-time 3D Reconstruction and Interaction Using a Moving Depth Camera**, UIST 2011.
+- Newcombe et al., **DynamicFusion: Reconstruction and Tracking of Non-rigid Scenes in Real-Time**, CVPR 2015.
+- Innmann et al., **VolumeDeform: Real-time Volumetric Non-rigid Reconstruction**, ECCV 2016.
 
 ## License
 
-See LICENSE file for details.
-
----
-
-## Contact & Support
-
-For issues, questions, or contributions, please contact the development team.
-
-**Last Updated**: May 2026
+See the repository license and third-party dependency licenses.

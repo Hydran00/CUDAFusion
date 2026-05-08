@@ -6,8 +6,11 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_BUILD_TYPE Release)
 
 # CUDA settings
-set(CMAKE_CUDA_ARCHITECTURES 89)
-set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --use_fast_math --expt-relaxed-constexpr -Xptxas=-O3")
+set(DFUSION_CUDA_ARCHITECTURES "89" CACHE STRING "CUDA architectures to build for, e.g. 89 for Ada, 86 for Ampere, 75 for Turing, or native")
+set(CMAKE_CUDA_ARCHITECTURES ${DFUSION_CUDA_ARCHITECTURES})
+message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG -march=native -ffast-math -fno-math-errno")
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --use_fast_math --extra-device-vectorization --expt-relaxed-constexpr -Xptxas=-O3 -Xcompiler=-O3,-march=native,-ffast-math,-fno-math-errno")
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 find_package(CUDAToolkit REQUIRED)
@@ -46,7 +49,10 @@ include_directories(
 # Library
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp src/*.cu kernels/*.cu)
 add_library(dfusion STATIC ${SOURCES})
-set_target_properties(dfusion PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(dfusion PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+)
 target_link_libraries(dfusion
     ${OpenCV_LIBS}
     Eigen3::Eigen
@@ -56,7 +62,10 @@ target_link_libraries(dfusion
     Open3D::Open3D
 )
 add_executable(run_fusion tests/main.cu)
-set_target_properties(run_fusion PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(run_fusion PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+)
 target_link_libraries(run_fusion PRIVATE dfusion Open3D::Open3D cudasift_lib)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(run_fusion PRIVATE OpenMP::OpenMP_CXX)

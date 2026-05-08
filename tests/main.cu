@@ -364,22 +364,22 @@ int main(int argc, char **argv)
                    .count();
     }
 
-    if (frame_idx % 30 == 0)
-    {
-      auto checkpoint_t0 = std::chrono::high_resolution_clock::now();
-      std::string path = "mesh_frame_" + std::to_string(frame_idx);
-      pipeline.save_mesh_ply(path + "_canonical.ply");
-      pipeline.save_warped_mesh_ply(path + "_warped.ply");
-      checkpoint_ms = std::chrono::duration<double, std::milli>(
-                          std::chrono::high_resolution_clock::now() - checkpoint_t0)
-                          .count();
-      if (!app.quiet)
-      {
-        std::cout << "[checkpoint] frame=" << format_int(frame_idx, 4)
-                  << " saved canonical + warped meshes"
-                  << " | time=" << format_ms(checkpoint_ms) << " ms\n";
-      }
-    }
+    // if (frame_idx % 30 == 0)
+    // {
+    //   auto checkpoint_t0 = std::chrono::high_resolution_clock::now();
+    //   std::string path = "mesh_frame_" + std::to_string(frame_idx);
+    //   pipeline.save_mesh_ply(path + "_canonical.ply");
+    //   pipeline.save_warped_mesh_ply(path + "_warped.ply");
+    //   checkpoint_ms = std::chrono::duration<double, std::milli>(
+    //                       std::chrono::high_resolution_clock::now() - checkpoint_t0)
+    //                       .count();
+    //   if (!app.quiet)
+    //   {
+    //     std::cout << "[checkpoint] frame=" << format_int(frame_idx, 4)
+    //               << " saved canonical + warped meshes"
+    //               << " | time=" << format_ms(checkpoint_ms) << " ms\n";
+    //   }
+    // }
 
     double frame_ms = std::chrono::duration<double, std::milli>(
                           std::chrono::high_resolution_clock::now() - frame_t0)

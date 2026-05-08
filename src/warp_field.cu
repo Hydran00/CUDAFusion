@@ -2,9 +2,12 @@
 #include "tsdf_volume.h"
 #include "se3_math.cuh"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
-#include <unordered_map>
+#include <limits>
 #include <tuple>
+#include <unordered_map>
+#include <vector>
 
 // ─────────────────────────────────────────────
 //  CPU spatial hash for O(1) proximity queries
@@ -102,6 +105,140 @@ namespace
                             out.push_back({dist2, idx});
                     }
                 }
+    }
+
+    float dist3h(float3 a, float3 b)
+    {
+        float3 d = make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
+        return sqrtf(dot3h(d, d));
+    }
+
+    struct SurfaceGraph
+    {
+        std::vector<float3> vertices;
+        std::vector<std::vector<std::pair<int, float>>> adjacency;
+        std::vector<int> vertex_rep;
+        SpatialGrid spatial;
+        float inv_cell = 1.0f;
+    };
+
+    CellKey quantized_cell(float3 p, float inv_cell)
+    {
+        return {(int)floorf(p.x * inv_cell + 0.5f),
+                (int)floorf(p.y * inv_cell + 0.5f),
+                (int)floorf(p.z * inv_cell + 0.5f)};
+    }
+
+    void add_graph_edge(SurfaceGraph &graph, int a, int b)
+    {
+        if (a == b)
+            return;
+        float w = dist3h(graph.vertices[a], graph.vertices[b]);
+        if (w <= 1e-8f)
+            return;
+        graph.adjacency[a].push_back({b, w});
+        graph.adjacency[b].push_back({a, w});
+    }
+
+    SurfaceGraph build_surface_graph(const std::vector<float3> &surface_vertices,
+                                     const std::vector<int3> &surface_triangles,
+                                     float min_dist)
+    {
+        SurfaceGraph graph;
+        graph.vertex_rep.resize(surface_vertices.size(), -1);
+        const float weld_cell = fmaxf(1e-5f, 0.05f * min_dist);
+        const float inv_weld = 1.0f / weld_cell;
+        std::unordered_map<CellKey, int, CellKeyHash> reps;
+        reps.reserve(surface_vertices.size());
+
+        for (size_t i = 0; i < surface_vertices.size(); ++i)
+        {
+            CellKey key = quantized_cell(surface_vertices[i], inv_weld);
+            auto it = reps.find(key);
+            if (it == reps.end())
+            {
+                int rep = (int)graph.vertices.size();
+                reps.emplace(key, rep);
+                graph.vertices.push_back(surface_vertices[i]);
+                graph.adjacency.emplace_back();
+                graph.vertex_rep[i] = rep;
+            }
+            else
+            {
+                graph.vertex_rep[i] = it->second;
+            }
+        }
+
+        for (const int3 &tri : surface_triangles)
+        {
+            if (tri.x < 0 || tri.y < 0 || tri.z < 0 ||
+                tri.x >= (int)graph.vertex_rep.size() ||
+                tri.y >= (int)graph.vertex_rep.size() ||
+                tri.z >= (int)graph.vertex_rep.size())
+                continue;
+            int a = graph.vertex_rep[tri.x];
+            int b = graph.vertex_rep[tri.y];
+            int c = graph.vertex_rep[tri.z];
+            add_graph_edge(graph, a, b);
+            add_graph_edge(graph, b, c);
+            add_graph_edge(graph, c, a);
+        }
+
+        graph.inv_cell = 1.0f / min_dist;
+        graph.spatial.reserve(graph.vertices.size() * 2);
+        for (int i = 0; i < (int)graph.vertices.size(); ++i)
+            graph.spatial[cell_of(graph.vertices[i], graph.inv_cell)].push_back(i);
+
+        return graph;
+    }
+
+    int nearest_graph_vertex(const SurfaceGraph &graph, float3 p)
+    {
+        if (graph.vertices.empty())
+            return -1;
+
+        auto [cx, cy, cz] = cell_of(p, graph.inv_cell);
+        float best_d2 = std::numeric_limits<float>::infinity();
+        int best = -1;
+        for (int radius = 1; radius <= 4 && best < 0; ++radius)
+        {
+            for (int dx = -radius; dx <= radius; dx++)
+                for (int dy = -radius; dy <= radius; dy++)
+                    for (int dz = -radius; dz <= radius; dz++)
+                    {
+                        auto it = graph.spatial.find({cx + dx, cy + dy, cz + dz});
+                        if (it == graph.spatial.end())
+                            continue;
+                        for (int idx : it->second)
+                        {
+                            float3 d = make_float3(p.x - graph.vertices[idx].x,
+                                                   p.y - graph.vertices[idx].y,
+                                                   p.z - graph.vertices[idx].z);
+                            float d2 = dot3h(d, d);
+                            if (d2 < best_d2)
+                            {
+                                best_d2 = d2;
+                                best = idx;
+                            }
+                        }
+                    }
+        }
+        if (best >= 0)
+            return best;
+
+        for (int i = 0; i < (int)graph.vertices.size(); ++i)
+        {
+            float3 d = make_float3(p.x - graph.vertices[i].x,
+                                   p.y - graph.vertices[i].y,
+                                   p.z - graph.vertices[i].z);
+            float d2 = dot3h(d, d);
+            if (d2 < best_d2)
+            {
+                best_d2 = d2;
+                best = i;
+            }
+        }
+        return best;
     }
 
 } // namespace
@@ -266,6 +403,295 @@ __global__ void compute_voxel_knn_kernel(
         knn_ws[vidx * K_NEIGHBORS + k] = weights[k] * inv_sum;
     }
 }
+
+__global__ void score_node_tsdf_support_kernel(
+    const TSDFVoxel *voxels,
+    int3 dims,
+    float3 origin,
+    float voxel_size,
+    const DeformNode *nodes,
+    int num_nodes,
+    float support_radius_factor,
+    float surface_tsdf_abs,
+    float empty_tsdf,
+    int min_observed_voxels,
+    int min_surface_voxels,
+    unsigned char *keep_flags)
+{
+    int ni = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ni >= num_nodes)
+        return;
+
+    DeformNode node = nodes[ni];
+    float radius = fmaxf(node.radius * support_radius_factor, voxel_size);
+    float radius2 = radius * radius;
+    int3 c = make_int3(
+        (int)floorf((node.pos.x - origin.x) / voxel_size),
+        (int)floorf((node.pos.y - origin.y) / voxel_size),
+        (int)floorf((node.pos.z - origin.z) / voxel_size));
+    int r = (int)ceilf(radius / voxel_size);
+
+    int observed = 0;
+    int surface = 0;
+    int empty = 0;
+    int x0 = c.x - r < 0 ? 0 : c.x - r;
+    int y0 = c.y - r < 0 ? 0 : c.y - r;
+    int z0 = c.z - r < 0 ? 0 : c.z - r;
+    int x1 = c.x + r >= dims.x ? dims.x - 1 : c.x + r;
+    int y1 = c.y + r >= dims.y ? dims.y - 1 : c.y + r;
+    int z1 = c.z + r >= dims.z ? dims.z - 1 : c.z + r;
+
+    for (int z = z0; z <= z1; ++z)
+        for (int y = y0; y <= y1; ++y)
+            for (int x = x0; x <= x1; ++x)
+            {
+                float3 p = make_float3(
+                    origin.x + (x + 0.5f) * voxel_size,
+                    origin.y + (y + 0.5f) * voxel_size,
+                    origin.z + (z + 0.5f) * voxel_size);
+                float3 d = make_float3(p.x - node.pos.x,
+                                       p.y - node.pos.y,
+                                       p.z - node.pos.z);
+                if (d.x * d.x + d.y * d.y + d.z * d.z > radius2)
+                    continue;
+
+                const TSDFVoxel &v = voxels[z * dims.x * dims.y + y * dims.x + x];
+                if (v.weight <= 0.0f)
+                    continue;
+                observed++;
+                if (fabsf(v.tsdf) <= surface_tsdf_abs)
+                    surface++;
+                if (v.tsdf >= empty_tsdf)
+                    empty++;
+            }
+
+    bool unknown = observed < min_observed_voxels;
+    bool supported = surface >= min_surface_voxels;
+    bool confidently_empty = empty >= min_observed_voxels && surface == 0;
+    keep_flags[ni] = (unknown || supported || !confidently_empty) ? 1 : 0;
+}
+
+__device__ __forceinline__ bool atomic_min_float(float *addr, float value)
+{
+    int *addr_i = reinterpret_cast<int *>(addr);
+    int old = *addr_i;
+    while (value < __int_as_float(old))
+    {
+        int assumed = old;
+        old = atomicCAS(addr_i, assumed, __float_as_int(value));
+        if (old == assumed)
+            return true;
+    }
+    return false;
+}
+
+__global__ void init_geodesic_dist_kernel(float *dist,
+                                          const int *node_reps,
+                                          int source_start,
+                                          int batch_count,
+                                          int n_vertices)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_count * n_vertices;
+    if (idx >= total)
+        return;
+
+    int s = idx / n_vertices;
+    int v = idx - s * n_vertices;
+    int source = node_reps[source_start + s];
+    dist[idx] = (v == source) ? 0.0f : 1e30f;
+}
+
+__global__ void relax_geodesic_edges_kernel(const int *row_ptr,
+                                            const int *col_idx,
+                                            const float *edge_w,
+                                            int n_vertices,
+                                            int batch_count,
+                                            float max_dist,
+                                            float *dist,
+                                            int *changed)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_count * n_vertices;
+    if (idx >= total)
+        return;
+
+    int s = idx / n_vertices;
+    int u = idx - s * n_vertices;
+    float du = dist[idx];
+    if (!isfinite(du) || du > max_dist)
+        return;
+
+    int base = s * n_vertices;
+    for (int e = row_ptr[u]; e < row_ptr[u + 1]; ++e)
+    {
+        int v = col_idx[e];
+        float nd = du + edge_w[e];
+        if (nd <= max_dist && atomic_min_float(&dist[base + v], nd))
+            *changed = 1;
+    }
+}
+
+__global__ void select_geodesic_neighbors_kernel(const float *dist,
+                                                 const int *node_reps,
+                                                 int source_start,
+                                                 int batch_count,
+                                                 int n_vertices,
+                                                 int n_nodes,
+                                                 float max_dist,
+                                                 int *out_ids,
+                                                 float *out_dist)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= batch_count)
+        return;
+
+    int source_node = source_start + s;
+    float best_dist[K_GRAPH];
+    int best_id[K_GRAPH];
+#pragma unroll
+    for (int k = 0; k < K_GRAPH; ++k)
+    {
+        best_dist[k] = 1e30f;
+        best_id[k] = -1;
+    }
+
+    const float *src_dist = dist + s * n_vertices;
+    for (int node_id = 0; node_id < n_nodes; ++node_id)
+    {
+        if (node_id == source_node)
+            continue;
+        int rep = node_reps[node_id];
+        if (rep < 0 || rep >= n_vertices)
+            continue;
+        float gd = src_dist[rep];
+        if (!isfinite(gd) || gd <= 0.0f || gd > max_dist ||
+            gd >= best_dist[K_GRAPH - 1])
+            continue;
+
+        best_dist[K_GRAPH - 1] = gd;
+        best_id[K_GRAPH - 1] = node_id;
+        for (int k = K_GRAPH - 2; k >= 0; --k)
+        {
+            if (best_dist[k + 1] >= best_dist[k])
+                break;
+            float td = best_dist[k];
+            best_dist[k] = best_dist[k + 1];
+            best_dist[k + 1] = td;
+            int ti = best_id[k];
+            best_id[k] = best_id[k + 1];
+            best_id[k + 1] = ti;
+        }
+    }
+
+#pragma unroll
+    for (int k = 0; k < K_GRAPH; ++k)
+    {
+        int out = s * K_GRAPH + k;
+        out_ids[out] = best_id[k];
+        out_dist[out] = best_dist[k];
+    }
+}
+
+std::vector<std::vector<std::pair<float, int>>> geodesic_neighbors_for_nodes_gpu(
+    const SurfaceGraph &graph,
+    const std::vector<int> &node_reps,
+    float max_geodesic_dist)
+{
+    const int n_nodes = (int)node_reps.size();
+    const int n_vertices = (int)graph.vertices.size();
+    std::vector<std::vector<std::pair<float, int>>> result(n_nodes);
+    if (n_nodes <= 0 || n_vertices <= 0)
+        return result;
+
+    std::vector<int> row_ptr(n_vertices + 1, 0);
+    int edge_count = 0;
+    for (int v = 0; v < n_vertices; ++v)
+    {
+        row_ptr[v] = edge_count;
+        edge_count += (int)graph.adjacency[v].size();
+    }
+    row_ptr[n_vertices] = edge_count;
+
+    std::vector<int> col_idx(edge_count);
+    std::vector<float> edge_w(edge_count);
+    for (int v = 0; v < n_vertices; ++v)
+    {
+        int out = row_ptr[v];
+        for (const auto &e : graph.adjacency[v])
+        {
+            col_idx[out] = e.first;
+            edge_w[out] = e.second;
+            out++;
+        }
+    }
+
+    DeviceArray<int> d_row_ptr, d_col_idx, d_node_reps, d_out_ids, d_changed;
+    DeviceArray<float> d_edge_w, d_dist, d_out_dist;
+    d_row_ptr.upload(row_ptr);
+    d_col_idx.upload(col_idx);
+    d_edge_w.upload(edge_w);
+    d_node_reps.upload(node_reps);
+    d_changed.allocate(1);
+
+    constexpr int kBatchSources = 32;
+    const int block = 256;
+    const int max_iters = 96;
+
+    for (int source_start = 0; source_start < n_nodes; source_start += kBatchSources)
+    {
+        int batch_count = std::min(kBatchSources, n_nodes - source_start);
+        d_dist.allocate((size_t)batch_count * n_vertices);
+        d_out_ids.allocate((size_t)batch_count * K_GRAPH);
+        d_out_dist.allocate((size_t)batch_count * K_GRAPH);
+
+        int init_total = batch_count * n_vertices;
+        init_geodesic_dist_kernel<<<grid1d(init_total, block), block>>>(
+            d_dist.data, d_node_reps.data, source_start, batch_count, n_vertices);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        for (int iter = 0; iter < max_iters; ++iter)
+        {
+            d_changed.zero();
+            relax_geodesic_edges_kernel<<<grid1d(init_total, block), block>>>(
+                d_row_ptr.data, d_col_idx.data, d_edge_w.data, n_vertices,
+                batch_count, max_geodesic_dist, d_dist.data, d_changed.data);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            int h_changed = 0;
+            CUDA_CHECK(cudaMemcpy(&h_changed, d_changed.data, sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+            if (!h_changed)
+                break;
+        }
+
+        select_geodesic_neighbors_kernel<<<grid1d(batch_count, 128), 128>>>(
+            d_dist.data, d_node_reps.data, source_start, batch_count, n_vertices,
+            n_nodes, max_geodesic_dist, d_out_ids.data, d_out_dist.data);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<int> h_ids;
+        std::vector<float> h_dist;
+        d_out_ids.download(h_ids);
+        d_out_dist.download(h_dist);
+        for (int s = 0; s < batch_count; ++s)
+        {
+            int node_id = source_start + s;
+            for (int k = 0; k < K_GRAPH; ++k)
+            {
+                int nb = h_ids[s * K_GRAPH + k];
+                float gd = h_dist[s * K_GRAPH + k];
+                if (nb >= 0 && std::isfinite(gd))
+                    result[node_id].push_back({gd, nb});
+            }
+        }
+    }
+
+    return result;
+}
 // ─────────────────────────────────────────────
 //  WarpField implementazione
 // ─────────────────────────────────────────────
@@ -408,6 +834,63 @@ int WarpField::add_nodes_from_surface(
     return added;
 }
 
+int WarpField::add_nodes_from_mesh_geodesic(
+    const std::vector<float3> &surface_vertices,
+    const std::vector<int3> &surface_triangles,
+    float min_dist,
+    const std::vector<float3> *surface_normals)
+{
+    int added = add_nodes_from_surface(surface_vertices, min_dist, surface_normals);
+    if (added <= 0 || num_nodes_ == 0 || surface_vertices.empty() ||
+        surface_triangles.empty())
+        return added;
+
+    SurfaceGraph graph = build_surface_graph(surface_vertices, surface_triangles, min_dist);
+    if (graph.vertices.empty())
+        return added;
+
+    std::vector<int> node_reps(num_nodes_, -1);
+    for (int ni = 0; ni < num_nodes_; ++ni)
+        node_reps[ni] = nearest_graph_vertex(graph, h_nodes_[ni].pos);
+
+    const float max_geodesic_dist = fmaxf(3.5f * min_dist, 1.5f * node_radius_);
+    auto geodesic_neighbors =
+        geodesic_neighbors_for_nodes_gpu(graph, node_reps, max_geodesic_dist);
+
+    constexpr float kMinGraphNormalDot = 0.70f;
+    for (int ni = 0; ni < num_nodes_; ++ni)
+    {
+        DeformNode &node = h_nodes_[ni];
+        node.num_neighbors = 0;
+        memset(node.neighbors, -1, sizeof(node.neighbors));
+        memset(node.neighbor_w, 0, sizeof(node.neighbor_w));
+
+        for (const auto &entry : geodesic_neighbors[ni])
+        {
+            int nb = entry.second;
+            float gd = entry.first;
+            if (nb < 0 || nb >= num_nodes_ || nb == ni)
+                continue;
+            if (norm3h(node.normal) > 1e-6f && norm3h(h_nodes_[nb].normal) > 1e-6f &&
+                dot3h(node.normal, h_nodes_[nb].normal) < kMinGraphNormalDot)
+                continue;
+
+            int k = node.num_neighbors;
+            if (k >= K_GRAPH)
+                break;
+            node.neighbors[k] = nb;
+            float r = fmaxf(node.radius, 1e-6f);
+            node.neighbor_w[k] = expf(-(gd * gd) / (2.0f * r * r));
+            node.num_neighbors++;
+        }
+    }
+
+    CUDA_CHECK(cudaMemcpy(d_nodes_.data, h_nodes_.data(),
+                          num_nodes_ * sizeof(DeformNode),
+                          cudaMemcpyHostToDevice));
+    return added;
+}
+
 void WarpField::compute_voxel_knn(
     const TSDFVolume &volume,
     DeviceArray<int> &d_voxel_knn,
@@ -435,6 +918,126 @@ void WarpField::compute_voxel_knn(
         d_voxel_knn.data, d_voxel_knn_w.data);
 
     cudaDeviceSynchronize();
+}
+
+int WarpField::prune_nodes(const TSDFVolume &volume,
+                           const WarpField::PruneParams &params)
+{
+    if (!params.enabled || num_nodes_ == 0)
+        return 0;
+
+    DeviceArray<unsigned char> d_keep(num_nodes_);
+    const auto &p = volume.params();
+    score_node_tsdf_support_kernel<<<grid1d(num_nodes_, 128), 128>>>(
+        volume.device_data(), p.dims, p.origin, p.voxel_size,
+        d_nodes_.data, num_nodes_, params.support_radius_factor,
+        params.surface_tsdf_abs, params.empty_tsdf,
+        params.min_observed_voxels, params.min_surface_voxels, d_keep.data);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<unsigned char> keep;
+    d_keep.download(keep);
+
+    if (params.remove_disconnected)
+    {
+        std::vector<std::vector<int>> adj(num_nodes_);
+        for (int i = 0; i < num_nodes_; ++i)
+        {
+            if (!keep[i])
+                continue;
+            for (int k = 0; k < h_nodes_[i].num_neighbors; ++k)
+            {
+                int nb = h_nodes_[i].neighbors[k];
+                if (nb < 0 || nb >= num_nodes_ || !keep[nb])
+                    continue;
+                adj[i].push_back(nb);
+                adj[nb].push_back(i);
+            }
+        }
+
+        std::vector<unsigned char> seen(num_nodes_, 0);
+        for (int start = 0; start < num_nodes_; ++start)
+        {
+            if (!keep[start] || seen[start])
+                continue;
+            std::vector<int> stack{start};
+            std::vector<int> comp;
+            seen[start] = 1;
+            while (!stack.empty())
+            {
+                int u = stack.back();
+                stack.pop_back();
+                comp.push_back(u);
+                for (int v : adj[u])
+                {
+                    if (!seen[v])
+                    {
+                        seen[v] = 1;
+                        stack.push_back(v);
+                    }
+                }
+            }
+            if ((int)comp.size() < params.min_component_size)
+            {
+                for (int idx : comp)
+                    keep[idx] = 0;
+            }
+        }
+    }
+
+    std::vector<int> remap(num_nodes_, -1);
+    std::vector<DeformNode> new_nodes;
+    std::vector<DualQuat> new_transforms;
+    new_nodes.reserve(num_nodes_);
+    new_transforms.reserve(num_nodes_);
+    for (int i = 0; i < num_nodes_; ++i)
+    {
+        if (!keep[i])
+            continue;
+        remap[i] = (int)new_nodes.size();
+        new_nodes.push_back(h_nodes_[i]);
+        new_transforms.push_back(h_transforms_[i]);
+    }
+
+    int removed = num_nodes_ - (int)new_nodes.size();
+    if (removed <= 0)
+        return 0;
+
+    for (DeformNode &node : new_nodes)
+    {
+        int out = 0;
+        int old_neighbors[K_GRAPH];
+        float old_weights[K_GRAPH];
+        memcpy(old_neighbors, node.neighbors, sizeof(old_neighbors));
+        memcpy(old_weights, node.neighbor_w, sizeof(old_weights));
+        memset(node.neighbors, -1, sizeof(node.neighbors));
+        memset(node.neighbor_w, 0, sizeof(node.neighbor_w));
+        for (int k = 0; k < node.num_neighbors && out < K_GRAPH; ++k)
+        {
+            int nb = old_neighbors[k];
+            if (nb < 0 || nb >= (int)remap.size() || remap[nb] < 0)
+                continue;
+            node.neighbors[out] = remap[nb];
+            node.neighbor_w[out] = old_weights[k];
+            out++;
+        }
+        node.num_neighbors = out;
+    }
+
+    num_nodes_ = (int)new_nodes.size();
+    h_nodes_.swap(new_nodes);
+    h_transforms_.swap(new_transforms);
+    CUDA_CHECK(cudaMemcpy(d_nodes_.data, h_nodes_.data(),
+                          num_nodes_ * sizeof(DeformNode),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_transforms_.data, h_transforms_.data(),
+                          num_nodes_ * sizeof(DualQuat),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_transforms_prev_.data, h_transforms_.data(),
+                          num_nodes_ * sizeof(DualQuat),
+                          cudaMemcpyHostToDevice));
+    return removed;
 }
 
 void WarpField::save_transforms()
