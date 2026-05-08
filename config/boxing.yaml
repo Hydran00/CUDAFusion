@@ -1,6 +1,6 @@
 sequence:
   # path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/upperbody"
-  path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/Umbrella"
+  path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/boxing"
   format: "tum"   # tum | icl | raw
   depth_scale: 0.001
   start_frame: 0
@@ -19,7 +19,7 @@ tsdf:
   voxel_size: 0.005
   truncation: 0.03
   origin: [-0.7, -0.7, 0.5]
-  decay_alpha: 0.80
+  decay_alpha: 0.85
   max_weight: 50.0
 
 solver:
@@ -30,24 +30,24 @@ solver:
   debug: false
 warp:
   node_radius: 0.02
-  node_min_dist: 0.02
+  node_min_dist: 0.015
   max_nodes: 2048
-  node_update_every_n: 10000
+  node_update_every_n: 1
   prune_nodes: true
   prune_disconnected: true
   prune_min_observed_voxels: 2
-  prune_min_surface_voxels: 5
-  prune_min_component_size: 16
+  prune_min_surface_voxels: 3
+  prune_min_component_size: 4
   prune_support_radius_factor: 0.75
   prune_surface_tsdf_abs: 0.28
   prune_empty_tsdf: 0.55
   max_dx_mean: 0.2    # ridotto da 2.0: limita deformazioni locali
   max_update_rot: 0.12  # ~7°, prevenire salti grandi
   max_update_trans: 0.04  # 4cm, contenere step size
-  update_scale: 0.0  # ridotto da 0.1: step più piccoli
+  update_scale: 0.3  # ridotto da 0.1: step più piccoli
   integrate_warped: true
-  integrate_min_optimized_count: 1
-  integrate_unwarped_fallback: false
+  integrate_min_optimized_count: 0
+  integrate_unwarped_fallback: true
 
 # icp:
 #   dist_threshold: 0.015
@@ -57,10 +57,10 @@ warp:
 #   min_valid_corrs: 5000
 
 icp:
-  dist_threshold: 0.2
-  angle_threshold: 0.0 #1
-  view_threshold: 0.0 
-  search_radius_px: 50
+  dist_threshold: 0.15
+  angle_threshold: 0.1
+  view_threshold: 0.1
+  search_radius_px: 10
   min_valid_corrs: 5000
 
 sift:
@@ -69,11 +69,12 @@ sift:
   max_history: 12
   max_matches_per_frame: 96
   octaves: 5
-  threshold: 3.0
+  threshold: 2.0
   max_match_error: 5.0
-  max_ambiguity: 0.85
-  max_3d_dist: 0.2
+  max_ambiguity: 1.0
+  max_3d_dist: 0.1
   weight: 0.4
+
 
 profiler:
   enabled: true

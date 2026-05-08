@@ -109,6 +109,7 @@ public:
     float sift_max_match_error = 5.0f;
     float sift_max_ambiguity = 0.85f;
     float sift_max_3d_dist = 0.20f;
+    float sift_max_pixel_dist = 0.0f;
     float sift_weight = 1.0f;
     bool debug_vis = false;
     int debug_every_n = 1;
@@ -116,6 +117,8 @@ public:
     int profile_every_n = 1;
     bool quiet = false;
   };
+
+  int num_nodes() const { return warp_field_->num_nodes(); }
 
   explicit DynamicFusionPipeline(const Params &p)
       : params_(p), frame_count_(0)
@@ -213,14 +216,15 @@ public:
             std::chrono::high_resolution_clock::now() - t_normals)
             .count();
 
-    // if (do_dbg)
-    // {
-    std::vector<float3> h_n;
-    d_depth_normals_.download(h_n);
-    cv::imshow("2_depth_normals",
-               dbg_normals(h_n, params_.cam.width, params_.cam.height));
-    cv::waitKey(1);
-    // }
+    if (do_dbg)
+    {
+      // cv::imshow("1_input_rgb", dbg_color_input(current_color_gray_, depth_m));
+      std::vector<float3> h_n;
+      d_depth_normals_.download(h_n);
+      cv::imshow("2_depth_normals",
+                 dbg_normals(h_n, params_.cam.width, params_.cam.height));
+      cv::waitKey(1);
+    }
 
     if (frame_count_ == 0)
     {
@@ -496,11 +500,15 @@ public:
           warp_field_->save_transforms();
           float trial_scales[] = {
               params_.update_scale,
-              // 0.5f * params_.update_scale,
-              // 0.25f * params_.update_scale,
-              // -params_.update_scale,
-              // -0.5f * params_.update_scale,
-              // -0.25f * params_.update_scale
+              0.5f * params_.update_scale,
+              0.25f * params_.update_scale,
+              0.125f * params_.update_scale,
+              0.0625f * params_.update_scale,
+              -0.0625f * params_.update_scale,
+              -0.125f * params_.update_scale,
+              -0.25f * params_.update_scale,
+              -0.5f * params_.update_scale,
+              -params_.update_scale,
           };
           float best_scale = 0.0f;
           double best_rmse = base_rmse;
@@ -510,9 +518,37 @@ public:
             warp_field_->restore_transforms();
             auto t_apply = std::chrono::high_resolution_clock::now();
             upload_scaled_delta_x(trial_scale);
-            warp_field_->apply_twist_increment(
-                d_delta_x_trial_, params_.max_update_rot,
-                params_.max_update_trans, 1.0f);
+            if (params_.debug_vis)
+            {
+              auto before_nodes = warp_field_->download_nodes();
+              auto before_trans = warp_field_->download_transforms();
+              warp_field_->apply_twist_increment(
+                  d_delta_x_trial_, params_.max_update_rot,
+                  params_.max_update_trans, 1.0f);
+              auto after_nodes = warp_field_->download_nodes();
+              auto after_trans = warp_field_->download_transforms();
+              double sum = 0.0;
+              double maxd = 0.0;
+              int nn = (int)after_nodes.size();
+              for (int ii = 0; ii < nn; ++ii)
+              {
+                float3 pb = dq_transform_point(dq_centered(before_trans[ii], before_nodes[ii].pos), before_nodes[ii].pos);
+                float3 pa = dq_transform_point(dq_centered(after_trans[ii], after_nodes[ii].pos), after_nodes[ii].pos);
+                double d = sqrt((pb.x - pa.x) * (pb.x - pa.x) + (pb.y - pa.y) * (pb.y - pa.y) + (pb.z - pa.z) * (pb.z - pa.z));
+                sum += d;
+                if (d > maxd)
+                  maxd = d;
+              }
+              double mean = nn > 0 ? sum / nn : 0.0;
+              std::cout << "[node move trial] frame=" << frame_count_ << " scale=" << trial_scale
+                        << " mean_m=" << mean << " max_m=" << maxd << "\n";
+            }
+            else
+            {
+              warp_field_->apply_twist_increment(
+                  d_delta_x_trial_, params_.max_update_rot,
+                  params_.max_update_trans, 1.0f);
+            }
             tracking_profile.apply_ms += elapsed_ms(t_apply);
 
             rasterize_deformed_mesh_live_surface(do_profile ? &tracking_profile
@@ -554,9 +590,36 @@ public:
 
           auto t_apply = std::chrono::high_resolution_clock::now();
           upload_scaled_delta_x(best_scale);
-          warp_field_->apply_twist_increment(
-              d_delta_x_trial_, params_.max_update_rot,
-              params_.max_update_trans, 1.0f);
+          if (params_.debug_vis)
+          {
+            auto before_nodes = warp_field_->download_nodes();
+            auto before_trans = warp_field_->download_transforms();
+            warp_field_->apply_twist_increment(
+                d_delta_x_trial_, params_.max_update_rot,
+                params_.max_update_trans, 1.0f);
+            auto after_nodes = warp_field_->download_nodes();
+            auto after_trans = warp_field_->download_transforms();
+            double sum = 0.0;
+            double maxd = 0.0;
+            int nn = (int)after_nodes.size();
+            for (int ii = 0; ii < nn; ++ii)
+            {
+              float3 pb = dq_transform_point(dq_centered(before_trans[ii], before_nodes[ii].pos), before_nodes[ii].pos);
+              float3 pa = dq_transform_point(dq_centered(after_trans[ii], after_nodes[ii].pos), after_nodes[ii].pos);
+              double d = sqrt((pb.x - pa.x) * (pb.x - pa.x) + (pb.y - pa.y) * (pb.y - pa.y) + (pb.z - pa.z) * (pb.z - pa.z));
+              sum += d;
+              if (d > maxd)
+                maxd = d;
+            }
+            double mean = nn > 0 ? sum / nn : 0.0;
+            std::cout << "[node move apply] frame=" << frame_count_ << " mean_m=" << mean << " max_m=" << maxd << "\n";
+          }
+          else
+          {
+            warp_field_->apply_twist_increment(
+                d_delta_x_trial_, params_.max_update_rot,
+                params_.max_update_trans, 1.0f);
+          }
           tracking_profile.apply_ms += elapsed_ms(t_apply);
 
           rasterize_deformed_mesh_live_surface(do_profile ? &tracking_profile
@@ -591,7 +654,8 @@ public:
       auto t_fusion = std::chrono::high_resolution_clock::now();
       if (params_.integrate_warped)
       {
-        if (warp_update_ok)
+        // if (warp_update_ok)
+        if (true)
         {
           mark_optimized_voxels();
           volume_->integrate(
@@ -742,6 +806,95 @@ public:
     pc.PaintUniformColor(Eigen::Vector3d(0.9, 0.9, 0.9));
   }
 
+  // Fill Open3D PointCloud with current node positions (warped)
+  void update_o3d_nodes(open3d::geometry::PointCloud &pc) const
+  {
+    int n_nodes = warp_field_->num_nodes();
+    pc.Clear();
+    if (n_nodes == 0)
+      return;
+    auto h_nodes = warp_field_->download_nodes();
+    auto h_transforms = warp_field_->download_transforms();
+    pc.points_.reserve(n_nodes);
+
+    // Lightweight: display each node using its centered dual-quaternion transform
+    for (int i = 0; i < n_nodes; ++i)
+    {
+      float3 p = dq_transform_point(dq_centered(h_transforms[i], h_nodes[i].pos), h_nodes[i].pos);
+      pc.points_.push_back(Eigen::Vector3d(p.x, p.y, p.z));
+    }
+    pc.PaintUniformColor(Eigen::Vector3d(0.0, 1.0, 0.0)); // green
+  }
+
+  // Fill Open3D LineSet with graph edges between nodes (warped positions)
+  void update_o3d_edges(open3d::geometry::LineSet &ls) const
+  {
+    int n_nodes = warp_field_->num_nodes();
+    ls.Clear();
+    if (n_nodes == 0)
+      return;
+    auto h_nodes = warp_field_->download_nodes();
+    auto h_transforms = warp_field_->download_transforms();
+    // points: prefer voxel knn mapping for exact match with raycast
+    ls.points_.reserve(n_nodes);
+    int total_voxels = params_.tsdf.dims.x * params_.tsdf.dims.y * params_.tsdf.dims.z;
+    bool have_voxel_knn = d_voxel_knn_.size() == (size_t)total_voxels * K_NEIGHBORS &&
+                          d_voxel_knn_w_.size() == (size_t)total_voxels * K_NEIGHBORS;
+    std::vector<int> h_voxel_knn;
+    std::vector<float> h_voxel_knn_w;
+    if (have_voxel_knn)
+    {
+      h_voxel_knn.resize((size_t)total_voxels * K_NEIGHBORS);
+      h_voxel_knn_w.resize((size_t)total_voxels * K_NEIGHBORS);
+      d_voxel_knn_.download(h_voxel_knn);
+      d_voxel_knn_w_.download(h_voxel_knn_w);
+    }
+    std::vector<Eigen::Vector3d> pts;
+    pts.reserve(n_nodes);
+    for (int i = 0; i < n_nodes; ++i)
+    {
+      float3 warped_p;
+      if (have_voxel_knn)
+      {
+        int vidx = canonical_voxel_index(h_nodes[i].pos);
+        if (vidx >= 0 && vidx < total_voxels)
+        {
+          const int *knn = h_voxel_knn.data() + vidx * K_NEIGHBORS;
+          const float *knn_w = h_voxel_knn_w.data() + vidx * K_NEIGHBORS;
+          float ws_local[K_NEIGHBORS];
+          for (int k = 0; k < K_NEIGHBORS; ++k)
+            ws_local[k] = knn_w[k];
+          warped_p = warp_point_dual_quat_host(h_nodes[i].pos, h_nodes, h_transforms, *(int (*)[K_NEIGHBORS])knn, ws_local);
+        }
+        else
+        {
+          float3 p = dq_transform_point(dq_centered(h_transforms[i], h_nodes[i].pos), h_nodes[i].pos);
+          warped_p = p;
+        }
+      }
+      else
+      {
+        int ids[K_NEIGHBORS];
+        float ws[K_NEIGHBORS];
+        skin_point_host(h_nodes[i].pos, h_nodes, h_transforms, warped_p, ids, ws);
+      }
+      pts.push_back(Eigen::Vector3d(warped_p.x, warped_p.y, warped_p.z));
+      ls.points_.push_back(pts.back());
+    }
+    // lines (unique undirected edges i<j)
+    for (int i = 0; i < n_nodes; ++i)
+    {
+      for (int k = 0; k < h_nodes[i].num_neighbors; ++k)
+      {
+        int j = h_nodes[i].neighbors[k];
+        if (j <= i || j < 0 || j >= n_nodes)
+          continue;
+        ls.lines_.push_back(Eigen::Vector2i(i, j));
+        ls.colors_.push_back(Eigen::Vector3d(1.0, 0.0, 0.0)); // red
+      }
+    }
+  }
+
   // Salva la mesh warped (live frame) come PLY
   // CPU skinning: per ogni vertice canonico, applica blend delle trasformazioni
   // nodi più vicini
@@ -871,6 +1024,16 @@ private:
         verts, tris, params_.node_min_dist, &norms);
     if (added > 0)
       need_knn_update = true;
+
+    // DEBUG: print changes to help diagnose static graph behavior
+    if (params_.debug_vis && (removed > 0 || added > 0))
+    {
+      int n_nodes = warp_field_->num_nodes();
+      std::cout << "[graph update] removed=" << removed
+                << " added=" << added
+                << " nodes=" << n_nodes << " verts=" << verts.size()
+                << " tris=" << tris.size() << std::endl;
+    }
     if (need_knn_update && warp_field_->num_nodes() > 0)
     {
       warp_field_->compute_voxel_knn(*volume_, d_voxel_knn_, d_voxel_knn_w_);
@@ -1191,8 +1354,23 @@ private:
   {
     std::vector<float> h_dx;
     d_delta_x_.download(h_dx);
-    for (float &v : h_dx)
-      v *= scale;
+    int n_nodes = warp_field_->num_nodes();
+    for (int i = 0; i < n_nodes; ++i)
+    {
+      float *dx = h_dx.data() + i * 6;
+      float rn = std::sqrt(dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]);
+      float tn = std::sqrt(dx[3] * dx[3] + dx[4] * dx[4] + dx[5] * dx[5]);
+      float rs = 1.0f;
+      float ts = 1.0f;
+      if (params_.max_update_rot > 0.0f && rn > params_.max_update_rot)
+        rs = params_.max_update_rot / rn;
+      if (params_.max_update_trans > 0.0f && tn > params_.max_update_trans)
+        ts = params_.max_update_trans / tn;
+      for (int k = 0; k < 3; ++k)
+        dx[k] *= rs * scale;
+      for (int k = 3; k < 6; ++k)
+        dx[k] *= ts * scale;
+    }
     d_delta_x_trial_.upload(h_dx);
   }
 
@@ -1375,6 +1553,15 @@ private:
         gray32, h_live, h_depth, h_pixel_knn, h_pixel_knn_w, h_hit_voxel_idx);
     int added = 0;
     int append_idx = n_pixels;
+    int sift_matches = 0;
+    int reject_match_quality = 0;
+    int reject_depth = 0;
+    int reject_no_src = 0;
+    int reject_far = 0;
+    int reject_pixel = 0;
+    std::vector<cv::Point2f> dbg_sift_src_pts;
+    std::vector<cv::Point2f> dbg_sift_dst_pts;
+    std::vector<unsigned char> dbg_sift_accepted;
     for (auto &hist : sift_history_)
     {
       {
@@ -1389,9 +1576,13 @@ private:
         const SiftPoint &sp = current->sift.h_data[i];
         if (sp.match < 0 || sp.match >= hist->sift.numPts)
           continue;
+        sift_matches++;
         if (sp.match_error > params_.sift_max_match_error ||
             sp.ambiguity > params_.sift_max_ambiguity)
+        {
+          reject_match_quality++;
           continue;
+        }
 
         int u = static_cast<int>(std::lround(sp.xpos));
         int v = static_cast<int>(std::lround(sp.ypos));
@@ -1401,12 +1592,18 @@ private:
         int dst_px = v * params_.cam.width + u;
         float d = h_depth[dst_px];
         if (d <= 0.01f)
+        {
+          reject_depth++;
           continue;
+        }
         float3 dst = params_.cam.unproject(u, v, d);
 
         const SparseFeature &src_feat = hist->features[sp.match];
         if (src_feat.canonical_src.z <= 0.01f || src_feat.node_ids[0] < 0)
+        {
+          reject_no_src++;
           continue;
+        }
         float3 warped_src = warp_point_host(src_feat.canonical_src, src_feat,
                                             h_nodes, h_transforms);
         float3 dst_world = camera_pose_.transform_point(dst);
@@ -1414,8 +1611,41 @@ private:
         float3 diff =
             make_float3(warped_src.x - dst_world.x, warped_src.y - dst_world.y,
                         warped_src.z - dst_world.z);
-        if (host_norm3(diff) > params_.sift_max_3d_dist)
+        bool accepted_match = host_norm3(diff) <= params_.sift_max_3d_dist;
+        bool has_src_uv = false;
+        float2 src_uv = make_float2(0.0f, 0.0f);
+        Mat4 T_cam_world = inverse_rigid_host(camera_pose_);
+        float3 src_cam = T_cam_world.transform_point(warped_src);
+        if (src_cam.z > 0.01f)
+        {
+          src_uv = params_.cam.project(src_cam);
+          has_src_uv = std::isfinite(src_uv.x) && std::isfinite(src_uv.y);
+        }
+        if (accepted_match && params_.sift_max_pixel_dist > 0.0f &&
+            has_src_uv)
+        {
+          float du = src_uv.x - (float)u;
+          float dv = src_uv.y - (float)v;
+          if (std::sqrt(du * du + dv * dv) > params_.sift_max_pixel_dist)
+          {
+            reject_pixel++;
+            accepted_match = false;
+          }
+        }
+        if (params_.debug_vis)
+        {
+          if (has_src_uv)
+          {
+            dbg_sift_src_pts.push_back(cv::Point2f(src_uv.x, src_uv.y));
+            dbg_sift_dst_pts.push_back(cv::Point2f((float)u, (float)v));
+            dbg_sift_accepted.push_back(accepted_match ? 1 : 0);
+          }
+        }
+        if (!accepted_match)
+        {
+          reject_far++;
           continue;
+        }
 
         append_idx = add_sparse_axis_constraint(h_corrs, append_idx, src_feat,
                                                 warped_src, dst, 0);
@@ -1426,6 +1656,31 @@ private:
         added += 3;
         frame_added++;
       }
+    }
+
+    if (params_.debug_vis && !params_.quiet)
+    {
+      std::cout << "  [sift debug] current_pts=" << current->sift.numPts
+                << " history=" << sift_history_.size()
+                << " raw_matches=" << sift_matches
+                << " reject_quality=" << reject_match_quality
+                << " reject_depth=" << reject_depth
+                << " reject_no_model_src=" << reject_no_src
+                << " reject_far=" << reject_far
+                << " reject_pixel=" << reject_pixel
+                << " added_constraints=" << added << "\n";
+      cv::Mat dbg_gray8;
+      gray32.convertTo(dbg_gray8, CV_8UC1);
+      // Prefer showing SIFT overlays on the input intensity / grayscale image
+      // instead of the depth colormap. Build a depth cv::Mat from h_depth
+      // and create a color/intensity visualization, then draw SIFT on it.
+      cv::Mat depth_mat(params_.cam.height, params_.cam.width, CV_32FC1,
+                        const_cast<float *>(h_depth.data()));
+      cv::Mat dbg_color = dbg_color_input(current_color_gray_, depth_mat);
+      cv::Mat dbg_sift_vis = dbg_sift_matches(dbg_color, dbg_sift_src_pts,
+                                              dbg_sift_dst_pts, dbg_sift_accepted);
+      cv::imshow("5_sift_matches", dbg_sift_vis);
+      cv::waitKey(1);
     }
 
     d_corrs_.upload(h_corrs);

@@ -127,9 +127,9 @@ __device__ __forceinline__ void compute_jacobian_row(
 {
     // ICP punto-piano: r = n^T (p - dst).
     // With a left-applied small twist, p' ~= p + omega x (p-c) + v.
-    // Thus dr/domega = n^T (omega x local_p)
-    //                 = omega^T (local_p x n).
-    // The opposite order, cross3(normal, local_p), flips the rotation update.
+    // The warp update is applied as a centered dual-quaternion increment. With
+    // the quaternion convention used below, the observed descent direction is
+    // obtained by projecting normal x local_p.
 
     float3 local_p = make_float3(warped_p.x - node_pos.x,
                                  warped_p.y - node_pos.y,
@@ -229,8 +229,7 @@ __host__ __device__ __forceinline__
         return make_float4(0, 0, 0, 1);
     return make_float4(q.x / n, q.y / n, q.z / n, q.w / n);
 }
-__host__ __device__ __forceinline__
-    float quat_dot(float4 a, float4 b)
+__host__ __device__ __forceinline__ float quat_dot(float4 a, float4 b)
 {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }

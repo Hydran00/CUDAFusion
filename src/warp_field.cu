@@ -724,6 +724,7 @@ int WarpField::add_nodes_from_surface(
         grid[cell_of(h_nodes_[i].pos, inv_cell)].push_back(i);
 
     int added = 0;
+    const int first_new = num_nodes_;
 
     // Increased threshold: 0.70 = cos(45°) vs 0.50 = cos(60°)
     // Prevents long edges across differently-oriented surfaces (e.g. arm-to-torso)
@@ -776,7 +777,9 @@ int WarpField::add_nodes_from_surface(
         }
         node.num_neighbors = k;
 
-        // Init transform: distance-weighted avg of k nearest neighbors
+        // Init transform: distance-weighted avg of nearby pre-existing nodes.
+        // Exclude nodes added earlier in this same batch so identity/default
+        // transforms cannot propagate through newly inserted nodes.
         DualQuat T_init = DualQuat::identity();
         if (k > 0)
         {
@@ -786,8 +789,11 @@ int WarpField::add_nodes_from_surface(
             T_acc.dual = make_float4(0, 0, 0, 0);
             for (int i = 0; i < k; i++)
             {
+                int nb = near[i].second;
+                if (nb < 0 || nb >= first_new)
+                    continue;
                 float w = 1.f / (sqrtf(near[i].first) + 1e-6f);
-                DualQuat Tn = h_transforms_[near[i].second];
+                DualQuat Tn = h_transforms_[nb];
                 if (quat_dot(Tn.real, T_acc.real) < 0.0f)
                 {
                     Tn.real.x *= -1;
@@ -882,6 +888,63 @@ int WarpField::add_nodes_from_mesh_geodesic(
             float r = fmaxf(node.radius, 1e-6f);
             node.neighbor_w[k] = expf(-(gd * gd) / (2.0f * r * r));
             node.num_neighbors++;
+        }
+    }
+    // If we added new nodes in this call, initialize their transforms by
+    // interpolating the DualQuat of nearby (pre-existing) nodes according
+    // to geodesic distances, so new nodes don't start with identity warp.
+    if (added > 0)
+    {
+        int first_new = num_nodes_ - added;
+        for (int ni = first_new; ni < num_nodes_; ++ni)
+        {
+            // Accumulate transforms from geodesic neighbors that existed
+            // before this insertion (nb < first_new).
+            DualQuat T_acc;
+            T_acc.real = make_float4(0, 0, 0, 0);
+            T_acc.dual = make_float4(0, 0, 0, 0);
+            float w_sum = 0.0f;
+            int used = 0;
+
+            for (const auto &entry : geodesic_neighbors[ni])
+            {
+                int nb = entry.second;
+                float gd = entry.first;
+                if (nb < 0 || nb >= first_new) // only use pre-existing nodes
+                    continue;
+                if (used >= K_GRAPH) // limit influence
+                    break;
+
+                float w = 1.f / (sqrtf(gd) + 1e-6f);
+                DualQuat Tn = h_transforms_[nb];
+                if (quat_dot(Tn.real, T_acc.real) < 0.0f)
+                {
+                    Tn.real.x *= -1;
+                    Tn.real.y *= -1;
+                    Tn.real.z *= -1;
+                    Tn.real.w *= -1;
+                    Tn.dual.x *= -1;
+                    Tn.dual.y *= -1;
+                    Tn.dual.z *= -1;
+                    Tn.dual.w *= -1;
+                }
+                T_acc.real.x += w * Tn.real.x;
+                T_acc.real.y += w * Tn.real.y;
+                T_acc.real.z += w * Tn.real.z;
+                T_acc.real.w += w * Tn.real.w;
+                T_acc.dual.x += w * Tn.dual.x;
+                T_acc.dual.y += w * Tn.dual.y;
+                T_acc.dual.z += w * Tn.dual.z;
+                T_acc.dual.w += w * Tn.dual.w;
+                w_sum += w;
+                used++;
+            }
+
+            if (w_sum > 0.0f)
+            {
+                h_transforms_[ni] = dq_normalize(T_acc);
+            }
+            // otherwise keep the existing initialization from add_nodes_from_surface
         }
     }
 

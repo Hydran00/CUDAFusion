@@ -147,7 +147,7 @@ void visualize_mesh_open3d(const std::vector<float3> &vertices,
     auto center = bbox.GetCenter();
 
     auto visualizer = std::make_shared<open3d::visualization::Visualizer>();
-    if (!visualizer->CreateVisualizerWindow("Mesh Extraction", 1280, 720))
+    if (!visualizer->CreateVisualizerWindow("Mesh Extraction", 1920, 1080))
     {
         std::cerr << "[Visualization] Could not create Open3D window\n";
         return;

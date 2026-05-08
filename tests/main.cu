@@ -272,19 +272,23 @@ int main(int argc, char **argv)
   std::shared_ptr<open3d::visualization::Visualizer> vis;
   std::shared_ptr<open3d::geometry::TriangleMesh> vis_mesh;
   std::shared_ptr<open3d::geometry::PointCloud> vis_pc;
+  std::shared_ptr<open3d::geometry::PointCloud> vis_nodes;
+  std::shared_ptr<open3d::geometry::LineSet> vis_edges;
 
   if (app.use_vis)
   {
     vis = std::make_shared<open3d::visualization::Visualizer>();
-    vis->CreateVisualizerWindow("DynamicFusion", 1920, 1080);
+    vis->CreateVisualizerWindow("DynamicFusion", 2500, 2000);
 
     vis->GetRenderOption().mesh_show_back_face_ = true;
 
     vis_mesh = std::make_shared<open3d::geometry::TriangleMesh>();
     vis_pc = std::make_shared<open3d::geometry::PointCloud>();
+    vis_nodes = std::make_shared<open3d::geometry::PointCloud>();
+    vis_edges = std::make_shared<open3d::geometry::LineSet>();
 
-    auto ref_frame = open3d::geometry::TriangleMesh::CreateCoordinateFrame(0.3);
-    vis->AddGeometry(ref_frame);
+    // auto ref_frame = open3d::geometry::TriangleMesh::CreateCoordinateFrame(0.3);
+    // vis->AddGeometry(ref_frame);
 
     float3 tsdf_min = df_params.tsdf.origin;
     float3 tsdf_max = make_float3(
@@ -293,11 +297,16 @@ int main(int argc, char **argv)
         df_params.tsdf.origin.z + df_params.tsdf.dims.z * df_params.tsdf.voxel_size);
     auto tsdf_bbox = create_bbox_lineset(tsdf_min, tsdf_max, {1.0, 1.0, 0.0});
     vis->AddGeometry(tsdf_bbox);
+    if (df_params.debug_vis)
+    {
+      vis->AddGeometry(vis_nodes);
+      vis->AddGeometry(vis_edges);
+    }
     vis->GetViewControl().SetFront({0.14, -0.25, -0.96});
     vis->GetViewControl().SetLookat({-0.13, -0.04, 0.68});
     vis->GetViewControl().SetUp({0.13, -0.96, 0.26});
     vis->GetViewControl().SetZoom(0.22);
-
+    vis->PollEvents();
     vis->UpdateRender();
   }
 
@@ -342,6 +351,13 @@ int main(int argc, char **argv)
         // Use raycast pointcloud visualization by default (faster, smooth normals)
         pipeline.update_o3d_raycast_pointcloud(*vis_pc);
         vis->AddGeometry(vis_pc);
+        // if (df_params.debug_vis)
+        // {
+        // pipeline.update_o3d_nodes(*vis_nodes);
+        // vis->AddGeometry(vis_nodes);
+        // pipeline.update_o3d_edges(*vis_edges);
+        // vis->AddGeometry(vis_edges);
+        // }
         if (!app.quiet)
           std::cout << "[vis] initial raycast pointcloud | points=" << vis_pc->points_.size() << "\n";
       }
@@ -350,12 +366,19 @@ int main(int argc, char **argv)
       {
         pipeline.update_o3d_raycast_pointcloud(*vis_pc);
         vis->UpdateGeometry(vis_pc);
+        // if (df_params.debug_vis)
+        // {
+        //   pipeline.update_o3d_nodes(*vis_nodes);
+        //   vis->UpdateGeometry(vis_nodes);
+        //   pipeline.update_o3d_edges(*vis_edges);
+        //   vis->UpdateGeometry(vis_edges);
+        // }
       }
 
-      vis->GetViewControl().SetFront({0.14, -0.25, -0.96});
-      vis->GetViewControl().SetLookat({-0.13, -0.04, 0.68});
-      vis->GetViewControl().SetUp({0.13, -0.96, 0.26});
-      vis->GetViewControl().SetZoom(0.22);
+      // vis->GetViewControl().SetFront({0.14, -0.25, -0.96});
+      // vis->GetViewControl().SetLookat({-0.13, -0.04, 0.68});
+      // vis->GetViewControl().SetUp({0.13, -0.96, 0.26});
+      // vis->GetViewControl().SetZoom(0.22);
 
       vis->PollEvents();
       vis->UpdateRender();
@@ -387,12 +410,19 @@ int main(int argc, char **argv)
     if (!app.quiet)
     {
       std::cout << "[frame " << format_int(frame_idx, 4) << "]"
+                << " num nodes=" << pipeline.num_nodes()
                 << " total=" << format_ms(frame_ms) << " ms"
                 << " | process=" << format_ms(process_ms) << " ms"
                 << " | vis=" << format_ms(vis_ms) << " ms"
                 << " | checkpoint=" << format_ms(checkpoint_ms) << " ms"
                 << " | integrated=" << (pipeline.last_frame_integrated() ? "yes" : "no")
-                << "\n";
+                << "\n--------------------------\n";
+    }
+    if (frame_idx == 2)
+    {
+      std::string a;
+      std::cout << "Press enter to start processing frames...\n";
+      std::getline(std::cin, a);
     }
   }
 

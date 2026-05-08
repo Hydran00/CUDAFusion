@@ -71,6 +71,10 @@ static AppConfig load_config(const std::string &path)
   out.df.tsdf.voxel_size = t["voxel_size"].as<float>();
   out.df.tsdf.truncation = t["truncation"].as<float>();
   out.df.tsdf.origin = read_float3(t["origin"]);
+  if (t["decay_alpha"])
+    out.df.tsdf.decay_alpha = t["decay_alpha"].as<float>();
+  if (t["max_weight"])
+    out.df.tsdf.max_weight = t["max_weight"].as<float>();
 
   auto sol = cfg["solver"];
   out.df.solver.gn_iterations = sol["gn_iterations"].as<int>();
@@ -78,6 +82,8 @@ static AppConfig load_config(const std::string &path)
   out.df.solver.lambda_smooth = sol["lambda_smooth"].as<float>();
   if (sol["lambda_damping"])
     out.df.solver.lambda_damping = sol["lambda_damping"].as<float>();
+  if (sol["debug"])
+    out.df.solver.debug = sol["debug"].as<bool>();
 
   auto w = cfg["warp"];
   out.df.node_radius = w["node_radius"].as<float>();
@@ -155,6 +161,8 @@ static AppConfig load_config(const std::string &path)
       out.df.sift_max_ambiguity = sift["max_ambiguity"].as<float>();
     if (sift["max_3d_dist"])
       out.df.sift_max_3d_dist = sift["max_3d_dist"].as<float>();
+    if (sift["max_pixel_dist"])
+      out.df.sift_max_pixel_dist = sift["max_pixel_dist"].as<float>();
     if (sift["weight"])
       out.df.sift_weight = sift["weight"].as<float>();
   }
@@ -177,6 +185,9 @@ static AppConfig load_config(const std::string &path)
 
   out.use_vis = cfg["visualizer"]["enabled"].as<bool>();
   out.df.quiet = out.quiet;
+
+  std::cout << "Loaded config from " << path << std::endl;
+  std::cout << cfg << std::endl;
 
   return out;
 }

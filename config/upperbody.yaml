@@ -1,6 +1,6 @@
 sequence:
   # path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/upperbody"
-  path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/Umbrella"
+  path: "/media/hydran00/CrucialX9/Nardi/Nardi_R-AL_2026/VolumeDeform/upperbody"
   format: "tum"   # tum | icl | raw
   depth_scale: 0.001
   start_frame: 0
@@ -17,34 +17,35 @@ camera:
 tsdf:
   dims: [256, 256, 256]
   voxel_size: 0.005
-  truncation: 0.03
-  origin: [-0.7, -0.7, 0.5]
-  decay_alpha: 0.80
+  truncation: 0.02
+  origin: [-0.7, -0.7, 0.0]
+  decay_alpha: 0.9
   max_weight: 50.0
 
 solver:
-  gn_iterations: 2
-  pcg_iterations: 80   # ridotto da 400: evita over-optimization
-  lambda_smooth: 100.0 # arap
-  lambda_damping: 1.0 # aumentato per più regolarizzazione
+  gn_iterations: 0
+  pcg_iterations: 0
+  lambda_smooth: 30.0 # arap
+  lambda_damping: 1.0
   debug: false
 warp:
   node_radius: 0.02
-  node_min_dist: 0.02
-  max_nodes: 2048
-  node_update_every_n: 10000
+  node_min_dist: 0.015
+  max_nodes: 4016
+  node_update_every_n: 20000
   prune_nodes: true
   prune_disconnected: true
   prune_min_observed_voxels: 2
-  prune_min_surface_voxels: 5
-  prune_min_component_size: 16
+  prune_min_surface_voxels: 3
+  prune_min_component_size: 4
   prune_support_radius_factor: 0.75
   prune_surface_tsdf_abs: 0.28
   prune_empty_tsdf: 0.55
-  max_dx_mean: 0.2    # ridotto da 2.0: limita deformazioni locali
-  max_update_rot: 0.12  # ~7°, prevenire salti grandi
-  max_update_trans: 0.04  # 4cm, contenere step size
-  update_scale: 0.0  # ridotto da 0.1: step più piccoli
+
+  max_dx_mean: 0.2
+  max_update_rot: 0.2
+  max_update_trans: 0.1
+  update_scale: 0.0
   integrate_warped: true
   integrate_min_optimized_count: 1
   integrate_unwarped_fallback: false
@@ -57,11 +58,11 @@ warp:
 #   min_valid_corrs: 5000
 
 icp:
-  dist_threshold: 0.2
-  angle_threshold: 0.0 #1
-  view_threshold: 0.0 
-  search_radius_px: 50
-  min_valid_corrs: 5000
+  rigid_tracking: true
+  dist_threshold: 0.08
+  angle_threshold: 0.5
+  view_threshold: 0.2
+  search_radius_px: 20
 
 sift:
   enabled: true
@@ -69,11 +70,12 @@ sift:
   max_history: 12
   max_matches_per_frame: 96
   octaves: 5
-  threshold: 3.0
+  threshold: 2.0
   max_match_error: 5.0
-  max_ambiguity: 0.85
-  max_3d_dist: 0.2
+  max_ambiguity: 1.0
+  max_3d_dist: 0.1
   weight: 0.4
+
 
 profiler:
   enabled: true

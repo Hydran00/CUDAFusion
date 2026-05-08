@@ -13,10 +13,13 @@
 
 namespace fs = std::filesystem;
 
+/**
+ * Structure to hold a single frame of data
+ */
 struct DepthFrame
 {
-  cv::Mat depth_m;
-  cv::Mat color_gray;
+  cv::Mat depth_m;    // Depth map in meters (float)
+  cv::Mat color_gray; // Grayscale version of the color image
   double timestamp = 0.0;
   int index = 0;
 };
@@ -36,7 +39,7 @@ public:
   {
     std::string path;
     Format format = Format::TUM;
-    float depth_scale = 0.001f;
+    float depth_scale = 0.001f; // Conversion factor to meters
     int start_frame = 0;
     int max_frames = -1;
     CameraIntrinsics cam;
@@ -63,14 +66,17 @@ public:
 
   DepthFrame next()
   {
-    auto &f = frames_[current_idx_++];
-    return f;
+    if (!has_next())
+      return {};
+    return frames_[current_idx_++];
   }
 
   int total() const { return (int)frames_.size(); }
-
   const CameraIntrinsics &camera() const { return cfg_.cam; }
 
+  /**
+   * Fallback utility: creates a grayscale visualization from depth if color is missing
+   */
   static void depth_to_gray(const cv::Mat &depth_m, cv::Mat &gray)
   {
     double min_v = 0.0, max_v = 0.0;
@@ -93,16 +99,74 @@ private:
   std::vector<DepthFrame> frames_;
   int current_idx_ = 0;
 
+  /**
+   * Logic for TUM datasets. Handles both standard associations.txt
+   * and direct 'depth'/'color' folder structures.
+   */
   void load_tum()
   {
     std::string assoc_path = cfg_.path + "/associations.txt";
     std::ifstream assoc(assoc_path);
+
+    // CASE A: No association file. Load directly from subfolders.
     if (!assoc.is_open())
     {
-      load_raw_dir(cfg_.path + "/depth", ".png");
+      std::cout << "[DepthSequence] No associations.txt found. Loading from /depth and /color subfolders.\n";
+
+      std::string depth_dir = cfg_.path + "/depth";
+      std::string color_dir = cfg_.path + "/color";
+
+      if (!fs::exists(depth_dir) || !fs::exists(color_dir))
+      {
+        std::cerr << "[Error] Ensure both /depth and /color folders exist.\n";
+        return;
+      }
+
+      // Collect all image paths
+      std::vector<std::string> d_paths, c_paths;
+      for (const auto &e : fs::directory_iterator(depth_dir))
+        if (e.path().extension() == ".png")
+          d_paths.push_back(e.path().string());
+      for (const auto &e : fs::directory_iterator(color_dir))
+        if (e.path().extension() == ".png")
+          c_paths.push_back(e.path().string());
+
+      // Sort alphabetically so that frame 001.png matches in both folders
+      std::sort(d_paths.begin(), d_paths.end());
+      std::sort(c_paths.begin(), c_paths.end());
+
+      size_t n = std::min(d_paths.size(), c_paths.size());
+      int added_count = 0;
+
+      for (size_t i = 0; i < n; ++i)
+      {
+        if (added_count < cfg_.start_frame)
+        {
+          added_count++;
+          continue;
+        }
+        if (cfg_.max_frames > 0 && (int)frames_.size() >= cfg_.max_frames)
+          break;
+
+        cv::Mat raw = cv::imread(d_paths[i], cv::IMREAD_ANYDEPTH);
+        cv::Mat color = cv::imread(c_paths[i], cv::IMREAD_GRAYSCALE);
+
+        if (raw.empty() || color.empty())
+          continue;
+
+        cv::Mat depth_m;
+        raw.convertTo(depth_m, CV_32F, cfg_.depth_scale);
+
+        // Ensure color image matches depth resolution
+        if (color.size() != depth_m.size())
+          cv::resize(color, color, depth_m.size(), 0, 0, cv::INTER_LINEAR);
+
+        frames_.push_back({depth_m, color, (double)i, (int)i});
+      }
       return;
     }
 
+    // CASE B: Standard TUM logic using associations.txt
     std::string line;
     int count = 0;
     while (std::getline(assoc, line))
@@ -123,6 +187,8 @@ private:
       ss >> ts_rgb >> rgb_file >> ts_depth >> depth_file;
 
       cv::Mat raw = cv::imread(cfg_.path + "/" + depth_file, cv::IMREAD_ANYDEPTH);
+      cv::Mat color = cv::imread(cfg_.path + "/" + rgb_file, cv::IMREAD_GRAYSCALE);
+
       if (raw.empty())
       {
         count++;
@@ -132,10 +198,8 @@ private:
       cv::Mat depth_m;
       raw.convertTo(depth_m, CV_32F, cfg_.depth_scale);
 
-      cv::Mat color = cv::imread(cfg_.path + "/" + rgb_file, cv::IMREAD_GRAYSCALE);
-      if (!color.empty() &&
-          (color.cols != depth_m.cols || color.rows != depth_m.rows))
-        cv::resize(color, color, depth_m.size(), 0.0, 0.0, cv::INTER_LINEAR);
+      if (!color.empty() && (color.size() != depth_m.size()))
+        cv::resize(color, color, depth_m.size(), 0, 0, cv::INTER_LINEAR);
 
       frames_.push_back({depth_m, color, ts_depth, count});
       count++;
@@ -153,24 +217,19 @@ private:
     load_raw_dir(cfg_.path, ext);
   }
 
-  void load_raw_dir(const std::string &dir, const std::string &ext,
-                    float depth_scale_override = -1.0f)
+  /**
+   * Generic loader for simple directories (generates color from depth)
+   */
+  void load_raw_dir(const std::string &dir, const std::string &ext)
   {
-    const float depth_scale =
-        (depth_scale_override > 0.0f) ? depth_scale_override : cfg_.depth_scale;
-
     if (!fs::exists(dir))
-    {
-      std::cerr << "[DepthSequence] Directory not found: " << dir << "\n";
       return;
-    }
 
     std::vector<std::string> paths;
     for (const auto &entry : fs::directory_iterator(dir))
-    {
       if (entry.path().extension() == ext)
         paths.push_back(entry.path().string());
-    }
+
     std::sort(paths.begin(), paths.end());
 
     int count = 0;
@@ -196,16 +255,15 @@ private:
       cv::Mat depth_m;
       if (raw.type() == CV_32F)
         depth_m = raw;
-      else if (raw.type() == CV_16U)
-        raw.convertTo(depth_m, CV_32F, depth_scale);
       else
-        raw.convertTo(depth_m, CV_32F);
+        raw.convertTo(depth_m, CV_32F, cfg_.depth_scale);
 
+      // Basic filtering
       cv::threshold(depth_m, depth_m, 0.1f, 0, cv::THRESH_TOZERO);
       cv::threshold(depth_m, depth_m, 6.0f, 0, cv::THRESH_TOZERO_INV);
 
       cv::Mat color;
-      depth_to_gray(depth_m, color);
+      depth_to_gray(depth_m, color); // Create fake grayscale from depth
       frames_.push_back({depth_m, color, (double)count, count});
       count++;
     }

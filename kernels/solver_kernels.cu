@@ -183,9 +183,14 @@ __global__ void add_diagonal_damping_kernel(
     for (int k = 0; k < BLOCK_DIM; k++)
     {
         float current_diag = diag[k * BLOCK_DIM + k];
-        diag[k * BLOCK_DIM + k] = current_diag + lambda * (current_diag + 1.0f);
+        // Levenberg damping should stabilize weak directions without becoming
+        // an absolute unit-scale spring. The previous +1.0 term dominated the
+        // normal-equation diagonal and effectively froze the graph for
+        // lambda>=1.
+        float floor_diag = (k < 3) ? 1e-3f : 1e-2f;
+        diag[k * BLOCK_DIM + k] =
+            current_diag + lambda * fmaxf(fabsf(current_diag), floor_diag);
     }
-    // diag[k * BLOCK_DIM + k] += lambda;
 }
 
 // ─────────────────────────────────────────────
@@ -227,9 +232,9 @@ __global__ void assemble_smooth_term_kernel(
         if (nj <= ni)
             continue;
 
-        float original_w = fmaxf(node_i.neighbor_w[k], 0.0f);
-        if (original_w <= 1e-8f)
-            continue;
+        // Use the geodesic/length-based graph weight, with a small floor so
+        // weak but valid edges still regularize the solve.
+        float neighbor_w = fmaxf(node_i.neighbor_w[k], 0.05f);
 
         float3 xj = nodes[nj].pos;
         float3 xi = node_i.pos;
@@ -262,7 +267,7 @@ __global__ void assemble_smooth_term_kernel(
 
         // Calcolo del peso di Huber per lo smoothness
         float huber_w = compute_huber_weight(r_norm, huber_smooth_delta);
-        float effective_lambda = lambda * original_w * huber_w * strain_weight;
+        float effective_lambda = lambda * neighbor_w * huber_w * strain_weight;
         if (effective_lambda <= 1e-8f)
             continue;
 
