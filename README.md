@@ -1,5 +1,6 @@
 # CUDA Non rigid RGB-D Fusion
 
+**Warning: This project is still experimental. It does not work as supposed yet.**
 CUDA implementation of a non-rigid RGB-D fusion pipeline. The system reconstructs dynamic scenes by combining a canonical TSDF volume, a deformation graph, projective ICP, sparse SIFT constraints, and GPU-accelerated mesh extraction/rasterization.
 
 The design follows the main ideas of **DynamicFusion** and **VolumeDeform**, with several practical additions for robustness and speed: CUDA TSDF integration, VolumeDeform-style deformed mesh prediction, geodesic graph edges, node pruning, sparse CudaSift support, profiling, and Open3D visualization.
